@@ -292,6 +292,104 @@ class MoleculeDecoder:
             return None
 
     # ────────────────────────────────────────────────────────────
+    # v3: 結構救援 — 從 Sanitize 失敗的分子中提取最大有效子圖
+    # ────────────────────────────────────────────────────────────
+
+    def _try_salvage(
+        self,
+        atom_codes: List[str],
+        bond_codes: List[str],
+        n_decoded_atoms: int,
+    ) -> Optional[Tuple[Chem.Mol, str, float, float]]:
+        """
+        當 build_molecule (含 SanitizeMol) 完全失敗時，
+        嘗試從原始 bit-string 建構未 sanitize 的分子圖，
+        再「逐片段」各自 sanitize，回傳最大有效子圖。
+
+        動機：
+          量子線路生成的 5-atom 結構可能在某一處違反化學價態
+          （如碳接 5 鍵），導致整體 SanitizeMol 失敗。
+          但其中 3~4 個原子構成的子圖可能是完全有效的。
+          丟棄整個結構等於浪費了「部分正確」的資訊，
+          造成 Fitness 獎勵過於稀疏 → 模式崩塌。
+
+        流程：
+          1. 按照 atom_codes/bond_codes 重建 RWMol（不 sanitize）
+          2. GetMolFrags 取得所有不連通的分子片段
+          3. 對每個片段「各自」嘗試 SanitizeMol
+          4. 回傳最大的有效片段，以及其覆蓋率
+
+        Args:
+            atom_codes:      原子 3-bit 碼列表
+            bond_codes:      鍵 2-bit 碼列表
+            n_decoded_atoms: 有效原子數量（遇到 NONE 前的原子數）
+
+        Returns:
+            (mol, smiles, qed, frag_coverage) 或 None
+            frag_coverage = 片段原子數 / n_decoded_atoms ∈ (0, 1]
+        """
+        if n_decoded_atoms < 2:
+            return None
+
+        # ── Step 1: 重建未 sanitize 的分子圖 ──
+        raw_mol = Chem.RWMol()
+        atom_indices: List[int] = []
+
+        for acode in atom_codes:
+            atom_info = ATOM_MAP.get(acode)
+            if atom_info is None:
+                break
+            try:
+                idx = raw_mol.AddAtom(Chem.Atom(atom_info[1]))
+                atom_indices.append(idx)
+            except Exception:
+                break
+
+        n = len(atom_indices)
+        if n < 2:
+            return None
+
+        for j in range(min(len(bond_codes), n - 1)):
+            bt = BOND_MAP.get(bond_codes[j])
+            if bt is None:
+                continue
+            try:
+                raw_mol.AddBond(atom_indices[j], atom_indices[j + 1], bt)
+            except Exception:
+                continue
+
+        # ── Step 2: 逐片段 sanitize ──
+        try:
+            frags = rdmolops.GetMolFrags(
+                raw_mol, asMols=True, sanitizeFrags=False
+            )
+        except Exception:
+            return None
+
+        best_frag: Optional[Chem.Mol] = None
+        best_size = 0
+
+        for frag in (frags or []):
+            try:
+                Chem.SanitizeMol(frag)
+                if frag.GetNumAtoms() > best_size:
+                    best_frag = frag
+                    best_size = frag.GetNumAtoms()
+            except Exception:
+                continue
+
+        if best_frag is None or best_size == 0:
+            return None
+
+        smiles = self.to_smiles(best_frag)
+        if smiles is None:
+            return None
+
+        qed = self.compute_qed(best_frag)
+        coverage = best_size / n_decoded_atoms
+        return best_frag, smiles, qed, coverage
+
+    # ────────────────────────────────────────────────────────────
     # QED 計算
     # ────────────────────────────────────────────────────────────
 
@@ -381,6 +479,14 @@ class MoleculeDecoder:
                 'qed': 0.0,
                 'valid': False,
                 'mol': None,
+                # v3: Shaping reward 結構元數據
+                'n_decoded_atoms': 0,
+                'n_bonds_formed': 0,
+                'partial_valid': False,
+                'partial_smiles': None,
+                'partial_qed': 0.0,
+                'frag_coverage': 0.0,
+                'partial_mol': None,
             }
 
             try:
@@ -397,7 +503,24 @@ class MoleculeDecoder:
                 record['atom_codes'] = atom_codes
                 record['bond_codes'] = bond_codes
 
-                # ── 建構分子 ──
+                # ── v3: 計算結構元數據（供 Shaping Reward 使用）──
+                n_decoded_atoms = 0
+                for ac in atom_codes:
+                    if ATOM_MAP.get(ac) is None:
+                        break
+                    n_decoded_atoms += 1
+                record['n_decoded_atoms'] = n_decoded_atoms
+
+                n_potential = min(
+                    len(bond_codes), max(n_decoded_atoms - 1, 0)
+                )
+                n_bonds_formed = sum(
+                    1 for j in range(n_potential)
+                    if BOND_MAP.get(bond_codes[j]) is not None
+                )
+                record['n_bonds_formed'] = n_bonds_formed
+
+                # ── 建構分子（完整 Sanitize）──
                 mol = self.build_molecule(atom_codes, bond_codes)
 
                 if mol is not None:
@@ -414,10 +537,20 @@ class MoleculeDecoder:
                         record['valid'] = True
                         record['mol'] = mol
 
+                # ── v3: Sanitize 失敗 → 嘗試救援最大有效子圖 ──
+                if not record['valid'] and n_decoded_atoms >= 2:
+                    salvage = self._try_salvage(
+                        atom_codes, bond_codes, n_decoded_atoms
+                    )
+                    if salvage is not None:
+                        s_mol, s_smi, s_qed, s_cov = salvage
+                        record['partial_valid'] = True
+                        record['partial_smiles'] = s_smi
+                        record['partial_qed'] = s_qed
+                        record['frag_coverage'] = s_cov
+                        record['partial_mol'] = s_mol
+
             except Exception:
-                # 【修正 #4】任何未預期的錯誤都安全地跳過，
-                # 不會導致主迴圈 crash。
-                # 該 bit-string 的 record 維持 valid=False, qed=0.0。
                 pass
 
             results.append(record)
@@ -425,23 +558,106 @@ class MoleculeDecoder:
         return results
 
     # ────────────────────────────────────────────────────────────
-    # 統計彙整
+    # v3: Per-molecule Shaping Reward
+    # ────────────────────────────────────────────────────────────
+
+    def _score_molecule(self, record: Dict) -> float:
+        """
+        為單一 bit-string 解碼結果計算「漸進式獎勵」分數。
+
+        四個組成項（權重合計 1.0）：
+        ┌─────────────────────────────────────────────────────────┐
+        │ 組成項          │ 權重  │ 意義                         │
+        ├─────────────────┼───────┼──────────────────────────────┤
+        │ size_ratio      │ 0.20  │ n_decoded_atoms / max_atoms  │
+        │                 │       │ → 鼓勵填滿所有原子槽位       │
+        │ connectivity    │ 0.10  │ n_bonds / (n_atoms − 1)      │
+        │                 │       │ → 鼓勵原子間形成鍵結         │
+        │ validity_score  │ 0.25  │ 完全有效=1.0 / 部分有效=     │
+        │                 │       │   0.3+0.3×coverage / 無效=0  │
+        │ qed_score       │ 0.45  │ 藥物相似性分數               │
+        └─────────────────┴───────┴──────────────────────────────┘
+
+        關鍵設計：
+        • 即使完全無效的結構，只要有 decoded atoms 就能拿到
+          size_ratio + connectivity 的基底分 → 消除獎勵稀疏。
+        • 部分有效（salvaged fragment）獲得中間分數 → 提供
+          從「無效大分子」到「有效大分子」的平滑梯度。
+        • QED 權重最高 (0.45) → 最終仍以藥物品質為導向。
+
+        Args:
+            record: decode_counts() 產出的單一結果 dict
+
+        Returns:
+            shaped_score ∈ [0.0, 1.0]
+        """
+        n_decoded = record.get('n_decoded_atoms', 0)
+        n_bonds = record.get('n_bonds_formed', 0)
+
+        if n_decoded == 0:
+            return 0.0
+
+        # ── Component 1: Size Ratio ──
+        # 線性獎勵：使用越多 atom 槽位 → 越接近 1.0
+        size_ratio = n_decoded / self.max_atoms
+
+        # ── Component 2: Connectivity ──
+        # 鍵結比率：實際形成的鍵 / 最大可能鍵數
+        max_bonds = max(n_decoded - 1, 1)
+        connectivity = min(n_bonds / max_bonds, 1.0)
+
+        # ── Component 3 & 4: Validity & QED ──
+        if record.get('valid'):
+            # 完全通過 SanitizeMol → 最高獎勵
+            validity_score = 1.0
+            qed_score = record.get('qed', 0.0)
+        elif record.get('partial_valid'):
+            # 部分有效（最大子圖通過 sanitize）→ 中間獎勵
+            coverage = record.get('frag_coverage', 0.0)
+            validity_score = 0.3 + 0.3 * coverage   # ∈ [0.3, 0.6]
+            qed_score = record.get('partial_qed', 0.0) * coverage
+        else:
+            # 完全無效 → 只靠結構分數（size + connectivity）
+            validity_score = 0.0
+            qed_score = 0.0
+
+        # ── 加權合計 ──
+        shaped = (
+            0.20 * size_ratio
+            + 0.10 * connectivity
+            + 0.25 * validity_score
+            + 0.45 * qed_score
+        )
+        return shaped
+
+    # ────────────────────────────────────────────────────────────
+    # 適應度計算 (Shaping Reward Fitness)
     # ────────────────────────────────────────────────────────────
 
     def compute_fitness(self, counts: Dict[str, int],
                         alpha: float = 0.4) -> Tuple[float, List[Dict]]:
         """
-        計算一組量子線路參數的適應度分數。
+        計算一組量子線路參數的 Shaping Reward 適應度分數。
 
-        適應度 = α × validity_ratio + (1 − α) × mean_qed
+        v3 漸進式獎勵：
+          fitness = α × mean_shaped + (1 − α) × mean_weighted_qed
 
-        【修正 #4 延伸】此函式呼叫 decode_counts()，後者內部的每個
-        分子解碼都被 try-except 保護。即使所有分子都化學無效，
-        此函式仍會回傳 fitness=0.0，保證主迴圈不會 crash。
+        核心改進（相對於 v2 的 α×validity + (1−α)×mean_qed）：
+        ──────────────────────────────────────────────────────────
+        1. mean_shaped：每個 bit-string 根據其 size / connectivity /
+           validity / QED 獲得 [0, 1] 的「漸進式」分數，
+           即使 Sanitize 失敗也有基底獎勵 → 消除稀疏獎勵問題。
+        2. mean_weighted_qed：不僅計算完全有效分子的 QED，
+           也將部分有效（salvaged fragment）的 QED 按覆蓋率
+           納入計算 → 為大分子提供平滑的 QED 訊號。
+
+        α 的語義：
+          α 高 → 結構探索（shaping 主導，鼓勵大分子）
+          α 低 → 品質利用（QED 主導，收斂到高品質分子）
 
         Args:
             counts: bit-string 計數字典
-            alpha:  validity_ratio 的權重 (0~1)
+            alpha:  shaping vs QED 的權重 (0~1)
 
         Returns:
             (fitness, decoded_results)
@@ -451,27 +667,30 @@ class MoleculeDecoder:
         try:
             decoded = self.decode_counts(counts)
         except Exception:
-            # 極端情況：整個 decode 過程失敗
             return 0.0, []
 
         if not decoded:
             return 0.0, decoded
 
-        total_unique = len(decoded)
-        valid_results = [r for r in decoded if r['valid']]
-        n_valid = len(valid_results)
+        # ── Per-molecule shaping scores ──
+        shaped_scores = [self._score_molecule(r) for r in decoded]
+        mean_shaped = float(np.mean(shaped_scores))
 
-        # 有效性比率
-        validity_ratio = n_valid / total_unique if total_unique > 0 else 0.0
+        # ── Weighted QED（含部分有效分子的部分 QED）──
+        qed_values: List[float] = []
+        for r in decoded:
+            if r.get('valid'):
+                qed_values.append(r['qed'])
+            elif r.get('partial_valid'):
+                qed_values.append(
+                    r['partial_qed'] * r['frag_coverage']
+                )
+            else:
+                qed_values.append(0.0)
+        mean_weighted_qed = float(np.mean(qed_values))
 
-        # 有效分子的平均 QED
-        if n_valid > 0:
-            mean_qed = np.mean([r['qed'] for r in valid_results])
-        else:
-            mean_qed = 0.0
-
-        # 組合適應度
-        fitness = alpha * validity_ratio + (1.0 - alpha) * float(mean_qed)
+        # ── 組合適應度 ──
+        fitness = alpha * mean_shaped + (1.0 - alpha) * mean_weighted_qed
 
         return fitness, decoded
 
