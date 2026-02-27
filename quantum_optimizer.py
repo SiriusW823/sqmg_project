@@ -335,6 +335,7 @@ class QuantumOptimizer:
                 'iteration': t,
                 'alpha': alpha,
                 'gbest_fitness': self.gbest_fitness,
+                'gbest_params': self.gbest.copy(),
                 'mean_fitness': float(np.mean(iteration_fitnesses)),
                 'max_fitness': float(np.max(iteration_fitnesses)),
                 'min_fitness': float(np.min(iteration_fitnesses)),

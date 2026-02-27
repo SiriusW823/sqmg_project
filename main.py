@@ -192,6 +192,10 @@ def create_iteration_callback(
     """
     建立 QPSO iteration_callback，用於每輪結束後評估 gbest 並記錄指標。
 
+    每一輪迭代結束時，optimizer 會把 gbest_params 放在 record 中傳進來，
+    callback 用這組參數進行 sample → decode → evaluate，將真實的
+    Validity / Uniqueness / Novelty / Mean_QED 寫入 extended_history。
+
     Args:
         kernel:           SQMGKernel 實例
         decoder:          MoleculeDecoder 實例
@@ -202,75 +206,61 @@ def create_iteration_callback(
     Returns:
         callback: Callable[[int, dict], None]
     """
+    # 用 set 做跨輪去重，避免每輪都重建
+    _seen_smiles: set = set()
+    for m in all_molecules:
+        _seen_smiles.add(m['smiles'])
+
     def callback(iteration: int, record: dict):
         """
         在每輪 QPSO 迭代結束後被呼叫。
-        使用當前 gbest 參數重新取樣並計算評估指標。
+        使用 record['gbest_params'] 重新取樣並計算評估指標。
         """
-        try:
-            from quantum_optimizer import QuantumOptimizer
-            # 取得目前 optimizer 的 gbest（透過閉包的 kernel 重新取樣）
-            # 注意：record 內已有 gbest_fitness，但我們需要完整的 decoded results
-            # 由於 callback 被 optimizer 呼叫，gbest 可以從外部同步
-            # 這裡我們用 fitness_fn 不同的方式，直接做一次 sample + decode
-            pass
-        except Exception:
-            pass
+        # ── 預設值（若評估失敗仍有合理紀錄）──
+        validity = 0.0
+        uniqueness = 0.0
+        novelty = 0.0
+        mean_qed = 0.0
 
-        # 將 QPSO 記錄中的基礎指標寫入 extended_history
+        gbest_params = record.get('gbest_params')
+        if gbest_params is not None:
+            try:
+                counts = kernel.sample(gbest_params)
+                decoded = decoder.decode_counts(counts)
+                metrics = evaluator.evaluate(decoded)
+
+                validity = metrics['validity']
+                uniqueness = metrics['uniqueness']
+                novelty = metrics['novelty']
+                mean_qed = metrics['mean_qed']
+
+                # 累積有效分子（跨輪去重）
+                for r in decoded:
+                    if r['valid'] and r['smiles'] not in _seen_smiles:
+                        all_molecules.append({
+                            'smiles': r['smiles'],
+                            'qed': r['qed'],
+                            'mol': r.get('mol'),
+                        })
+                        _seen_smiles.add(r['smiles'])
+            except Exception as e:
+                print(f"  [Callback Iter {iteration + 1}] 評估失敗: {e}")
+
         ext_record = {
             'iteration': record['iteration'],
             'gbest_fitness': record['gbest_fitness'],
             'mean_fitness': record.get('mean_fitness', 0),
+            'max_fitness': record.get('max_fitness', 0),
+            'min_fitness': record.get('min_fitness', 0),
             'alpha': record.get('alpha', 0),
-            'validity': 0.0,
-            'uniqueness': 0.0,
-            'novelty': 0.0,
-            'mean_qed': 0.0,
+            'validity': validity,
+            'uniqueness': uniqueness,
+            'novelty': novelty,
+            'mean_qed': mean_qed,
         }
         extended_history.append(ext_record)
 
     return callback
-
-
-def evaluate_gbest_full(
-    gbest_params: np.ndarray,
-    kernel: SQMGKernel,
-    decoder: MoleculeDecoder,
-    evaluator: MoleculeEvaluator,
-    extended_history: List[Dict],
-    all_molecules: List[Dict],
-):
-    """
-    使用 gbest 參數進行完整的評估並更新 extended_history 的最後一筆記錄。
-    同時將有效分子加入 all_molecules。
-
-    此函式在每輪 QPSO 結束後，在 main loop 中呼叫。
-    """
-    try:
-        counts = kernel.sample(gbest_params)
-        decoded = decoder.decode_counts(counts)
-        metrics = evaluator.evaluate(decoded)
-
-        # 更新最後一筆 extended_history
-        if extended_history:
-            extended_history[-1]['validity'] = metrics['validity']
-            extended_history[-1]['uniqueness'] = metrics['uniqueness']
-            extended_history[-1]['novelty'] = metrics['novelty']
-            extended_history[-1]['mean_qed'] = metrics['mean_qed']
-
-        # 累積有效分子（去重）
-        existing_smiles = {m['smiles'] for m in all_molecules}
-        for r in decoded:
-            if r['valid'] and r['smiles'] not in existing_smiles:
-                all_molecules.append({
-                    'smiles': r['smiles'],
-                    'qed': r['qed'],
-                    'mol': r.get('mol'),
-                })
-                existing_smiles.add(r['smiles'])
-    except Exception as e:
-        print(f"  [Eval Callback 警告] {e}")
 
 
 # ============================================================================
@@ -590,22 +580,8 @@ def main():
     best_params, best_fitness, history = optimizer.optimize()
     elapsed = time.time() - start_time
 
-    # ── 每輪結束後用 gbest 做完整評估 ──
-    print("\n[指標收集] 使用 gbest 重新評估各輪指標...")
-    for i, h in enumerate(history):
-        if i < len(extended_history):
-            # 更新 extended_history 中缺失的 QPSO 統計
-            extended_history[i]['gbest_fitness'] = h['gbest_fitness']
-            extended_history[i]['mean_fitness'] = h.get('mean_fitness', 0)
-            extended_history[i]['alpha'] = h.get('alpha', 0)
-
-    # 最終一次性評估：用每輪的 gbest 重新取樣（只對最後結果做完整評估以節省時間）
-    evaluate_gbest_full(
-        best_params, kernel, decoder, evaluator,
-        extended_history, all_molecules,
-    )
-
     print(f"\n總耗時: {elapsed:.1f} 秒 ({elapsed / 60:.1f} 分鐘)")
+    print(f"  extended_history 已收集 {len(extended_history)} 輪真實指標")
 
     # ================================================================
     # Step 8: 分析最佳結果
@@ -657,20 +633,6 @@ def main():
     print(f"\n{'─' * 70}")
     print("Step 9: CSV 匯出 & 視覺化")
     print(f"{'─' * 70}")
-
-    # 補完 extended_history（確保與 history 一致）
-    if len(extended_history) < len(history):
-        for i in range(len(extended_history), len(history)):
-            extended_history.append({
-                'iteration': history[i]['iteration'],
-                'gbest_fitness': history[i]['gbest_fitness'],
-                'mean_fitness': history[i].get('mean_fitness', 0),
-                'alpha': history[i].get('alpha', 0),
-                'validity': 0.0,
-                'uniqueness': 0.0,
-                'novelty': 0.0,
-                'mean_qed': 0.0,
-            })
 
     # CSV 匯出
     export_history_csv(
