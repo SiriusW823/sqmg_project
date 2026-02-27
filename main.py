@@ -215,6 +215,9 @@ def create_iteration_callback(
         """
         在每輪 QPSO 迭代結束後被呼叫。
         使用 record['gbest_params'] 重新取樣並計算評估指標。
+
+        重要：此處的 evaluator.evaluate() 只計算 valid=True
+        （完全通過 SanitizeMol）的分子，不包含 partial_valid。
         """
         # ── 預設值（若評估失敗仍有合理紀錄）──
         validity = 0.0
@@ -223,10 +226,15 @@ def create_iteration_callback(
         mean_qed = 0.0
 
         gbest_params = record.get('gbest_params')
-        if gbest_params is not None:
+        if gbest_params is None:
+            print(f"  [Callback Iter {iteration + 1}] 警告：gbest_params 為 None")
+        else:
             try:
                 counts = kernel.sample(gbest_params)
                 decoded = decoder.decode_counts(counts)
+
+                # evaluator.evaluate 只計算 valid=True 的分子
+                # （partial_valid 不會被納入 Validity/Uniqueness/Novelty）
                 metrics = evaluator.evaluate(decoded)
 
                 validity = metrics['validity']
@@ -234,15 +242,17 @@ def create_iteration_callback(
                 novelty = metrics['novelty']
                 mean_qed = metrics['mean_qed']
 
-                # 累積有效分子（跨輪去重）
+                # 累積有效分子（跨輪去重，只取 valid=True）
                 for r in decoded:
-                    if r['valid'] and r['smiles'] not in _seen_smiles:
-                        all_molecules.append({
-                            'smiles': r['smiles'],
-                            'qed': r['qed'],
-                            'mol': r.get('mol'),
-                        })
-                        _seen_smiles.add(r['smiles'])
+                    if r.get('valid') and not r.get('partial_valid'):
+                        smi = r.get('smiles')
+                        if smi and smi not in _seen_smiles:
+                            all_molecules.append({
+                                'smiles': smi,
+                                'qed': r['qed'],
+                                'mol': r.get('mol'),
+                            })
+                            _seen_smiles.add(smi)
             except Exception as e:
                 print(f"  [Callback Iter {iteration + 1}] 評估失敗: {e}")
 
@@ -257,6 +267,10 @@ def create_iteration_callback(
             'uniqueness': uniqueness,
             'novelty': novelty,
             'mean_qed': mean_qed,
+            # v3: QPSO 抗停滯診斷指標
+            'diversity': record.get('diversity', 0),
+            'stagnation_counter': record.get('stagnation_counter', 0),
+            'n_mutated': record.get('n_mutated', 0),
         }
         extended_history.append(ext_record)
 
@@ -268,12 +282,13 @@ def create_iteration_callback(
 # ============================================================================
 
 def export_history_csv(history: List[Dict], filepath: str):
-    """匯出迭代歷史指標至 CSV 檔案。"""
+    """匯出迭代歷史指標至 CSV 檔案（含 v3 抗停滯診斷欄位）。"""
     if not history:
         return
     fieldnames = [
         'Iteration', 'Gbest_Fitness', 'Mean_Fitness', 'Alpha',
-        'Validity', 'Uniqueness', 'Novelty', 'Mean_QED'
+        'Validity', 'Uniqueness', 'Novelty', 'Mean_QED',
+        'Diversity', 'Stagnation', 'N_Mutated',
     ]
     with open(filepath, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -288,6 +303,9 @@ def export_history_csv(history: List[Dict], filepath: str):
                 'Uniqueness': f"{h.get('uniqueness', 0):.4f}",
                 'Novelty': f"{h.get('novelty', 0):.4f}",
                 'Mean_QED': f"{h.get('mean_qed', 0):.6f}",
+                'Diversity': f"{h.get('diversity', 0):.4f}",
+                'Stagnation': h.get('stagnation_counter', 0),
+                'N_Mutated': h.get('n_mutated', 0),
             })
     print(f"  歷史指標已匯出至: {filepath}")
 
@@ -593,16 +611,18 @@ def main():
     valid_results = analyze_best_result(best_params, kernel, decoder)
 
     # 將 analyze 結果中的有效分子也加入 all_molecules
+    # 只取 valid=True 且 partial_valid 非 True 的分子
     if valid_results:
         existing_smiles = {m['smiles'] for m in all_molecules}
         for r in valid_results:
-            if r['smiles'] not in existing_smiles:
+            smi = r.get('smiles')
+            if smi and not r.get('partial_valid') and smi not in existing_smiles:
                 all_molecules.append({
-                    'smiles': r['smiles'],
+                    'smiles': smi,
                     'qed': r['qed'],
                     'mol': r.get('mol'),
                 })
-                existing_smiles.add(r['smiles'])
+                existing_smiles.add(smi)
 
     # ── 最終評估指標 ──
     print(f"\n{'─' * 70}")

@@ -210,8 +210,8 @@ def plot_chemical_space(
     Returns:
         圖片儲存路徑
     """
-    if len(molecules) < 3:
-        print(f"  [Plot] 警告：有效分子數不足 ({len(molecules)})，無法生成化學空間圖。")
+    if len(molecules) < 2:
+        print(f"  [Plot] 警告：有效分子數不足 ({len(molecules)}<2)，跳過化學空間圖。")
         return ""
 
     try:
@@ -251,8 +251,8 @@ def plot_chemical_space(
         except Exception:
             continue
 
-    if len(fps) < 3:
-        print(f"  [Plot] 警告：有效指紋數不足 ({len(fps)})，跳過化學空間圖。")
+    if len(fps) < 2:
+        print(f"  [Plot] 警告：唯一有效指紋數不足 ({len(fps)}<2)，跳過化學空間圖。")
         return ""
 
     X = np.array(fps)
@@ -260,9 +260,14 @@ def plot_chemical_space(
 
     # ── 降維 ──
     if method.lower() == "tsne":
-        perplexity = min(30, len(X) - 1)
+        n_samples = len(X)
+        if n_samples < 2:
+            print(f"  [Plot] 警告：t-SNE 樣本數不足 ({n_samples}<2)，跳過化學空間圖。")
+            return ""
+        # 動態設定 perplexity，確保 perplexity < n_samples
+        perplexity = min(30, max(1, n_samples - 1))
         reducer = TSNE(n_components=2, random_state=42,
-                      perplexity=max(perplexity, 2))
+                      perplexity=perplexity)
         X_2d = reducer.fit_transform(X)
         method_label = "t-SNE"
     else:

@@ -550,6 +550,15 @@ class MoleculeDecoder:
                         record['frag_coverage'] = s_cov
                         record['partial_mol'] = s_mol
 
+                # ── 防呆：嚴格確保 valid 與 partial_valid 互斥 ──
+                # partial_valid 僅用於 compute_fitness 的漸進式獎勵，
+                # 絕不能被計入 Validity / Uniqueness / Novelty / CSV 輸出。
+                if record.get('partial_valid'):
+                    record['valid'] = False
+                    record['smiles'] = None
+                    record['qed'] = 0.0
+                    record['mol'] = None
+
             except Exception:
                 pass
 
@@ -698,6 +707,13 @@ class MoleculeDecoder:
         """
         產生解碼結果的文字摘要。
 
+        嚴格區分三種狀態：
+          • Fully Valid  : valid=True  — 通過完整 SanitizeMol
+          • Partial Valid : partial_valid=True — 僅部分子圖通過 sanitize
+          • Invalid      : 兩者皆 False
+
+        只有 Fully Valid 的分子會被列入有效統計與 CSV 輸出。
+
         Args:
             decoded_results: decode_counts() 的回傳值
 
@@ -705,24 +721,52 @@ class MoleculeDecoder:
             格式化的文字摘要
         """
         total = len(decoded_results)
-        valid = [r for r in decoded_results if r['valid']]
+        # 嚴格篩選：valid=True 且 partial_valid 非 True
+        valid = [
+            r for r in decoded_results
+            if r.get('valid') and not r.get('partial_valid')
+        ]
+        partial = [
+            r for r in decoded_results
+            if r.get('partial_valid') and not r.get('valid')
+        ]
         n_valid = len(valid)
+        n_partial = len(partial)
 
         lines = [
-            f"  Unique bitstrings : {total}",
-            f"  Valid molecules   : {n_valid} / {total} "
-            f"({100 * n_valid / total:.1f}%)" if total > 0 else "",
+            f"  Unique bitstrings   : {total}",
         ]
+        if total > 0:
+            lines.append(
+                f"  Fully Valid         : {n_valid} / {total} "
+                f"({100 * n_valid / total:.1f}%)"
+            )
+            lines.append(
+                f"  Partial Valid       : {n_partial} / {total} "
+                f"({100 * n_partial / total:.1f}%)"
+            )
 
         if valid:
             qeds = [r['qed'] for r in valid]
-            lines.append(f"  Mean QED          : {np.mean(qeds):.4f}")
-            lines.append(f"  Max  QED          : {np.max(qeds):.4f}")
-            lines.append(f"  Top SMILES:")
+            lines.append(f"  Mean QED (valid)    : {np.mean(qeds):.4f}")
+            lines.append(f"  Max  QED (valid)    : {np.max(qeds):.4f}")
+            lines.append(f"  Top SMILES (fully valid):")
             # 取 QED 最高的前 5 個
             top5 = sorted(valid, key=lambda r: -r['qed'])[:5]
             for r in top5:
                 lines.append(f"    {r['smiles']:30s}  QED={r['qed']:.4f}  "
                              f"(count={r['count']})")
+
+        if partial:
+            partial_qeds = [r.get('partial_qed', 0) for r in partial]
+            lines.append(f"  Mean QED (partial)  : {np.mean(partial_qeds):.4f}")
+            lines.append(f"  Top Partial SMILES (僅供參考，不計入有效性統計):")
+            top3 = sorted(partial, key=lambda r: -r.get('partial_qed', 0))[:3]
+            for r in top3:
+                lines.append(
+                    f"    {r.get('partial_smiles', '?'):30s}  "
+                    f"QED={r.get('partial_qed', 0):.4f}  "
+                    f"cov={r.get('frag_coverage', 0):.2f}"
+                )
 
         return "\n".join(lines)
