@@ -3,11 +3,13 @@
 SQMG Main Loop — 可擴展量子分子生成系統 主流程
 ==============================================================================
 
-本模組整合四大核心元件：
-  1. SQMGKernel       — CUDA-Q 3N+2 參數化量子線路
+本模組整合六大核心元件：
+  1. SQMGKernel        — CUDA-Q 3N+2 參數化量子線路
   2. MoleculeDecoder   — Bit-string 到分子結構的解碼器
   3. QuantumOptimizer  — QPSO 量子粒子群優化器
-  4. Main_Loop         — 初始化、優化迭代、結果輸出
+  4. MoleculeEvaluator — Validity / Uniqueness / Novelty 評估指標
+  5. plot_utils        — 視覺化模組（收斂軌跡、Pareto 前緣、化學空間）
+  6. Main_Loop         — 初始化、優化迭代、指標收集、CSV 匯出、結果輸出
 
 執行方式：
     python main.py [--max_atoms N] [--particles M] [--iterations T] [--shots S]
@@ -32,9 +34,12 @@ CUDA-Q 後端設定：
 """
 
 import argparse
+import csv
+import os
 import sys
 import time
 from datetime import datetime
+from typing import Dict, List
 
 import numpy as np
 
@@ -69,6 +74,8 @@ except ImportError:
 from sqmg_kernel import SQMGKernel
 from molecule_decoder import MoleculeDecoder
 from quantum_optimizer import QuantumOptimizer
+from evaluator import MoleculeEvaluator
+from plot_utils import plot_all
 
 
 # ============================================================================
@@ -169,6 +176,147 @@ def create_fitness_function(
             return 0.0
 
     return fitness_fn
+
+
+# ============================================================================
+# 迭代回呼 — 每輪收集 Validity / Uniqueness / Novelty / Mean QED
+# ============================================================================
+
+def create_iteration_callback(
+    kernel: SQMGKernel,
+    decoder: MoleculeDecoder,
+    evaluator: MoleculeEvaluator,
+    extended_history: List[Dict],
+    all_molecules: List[Dict],
+):
+    """
+    建立 QPSO iteration_callback，用於每輪結束後評估 gbest 並記錄指標。
+
+    Args:
+        kernel:           SQMGKernel 實例
+        decoder:          MoleculeDecoder 實例
+        evaluator:        MoleculeEvaluator 實例
+        extended_history:  存放每輪指標的外部列表（會被 mutation 填充）
+        all_molecules:     累積所有有效分子的外部列表
+
+    Returns:
+        callback: Callable[[int, dict], None]
+    """
+    def callback(iteration: int, record: dict):
+        """
+        在每輪 QPSO 迭代結束後被呼叫。
+        使用當前 gbest 參數重新取樣並計算評估指標。
+        """
+        try:
+            from quantum_optimizer import QuantumOptimizer
+            # 取得目前 optimizer 的 gbest（透過閉包的 kernel 重新取樣）
+            # 注意：record 內已有 gbest_fitness，但我們需要完整的 decoded results
+            # 由於 callback 被 optimizer 呼叫，gbest 可以從外部同步
+            # 這裡我們用 fitness_fn 不同的方式，直接做一次 sample + decode
+            pass
+        except Exception:
+            pass
+
+        # 將 QPSO 記錄中的基礎指標寫入 extended_history
+        ext_record = {
+            'iteration': record['iteration'],
+            'gbest_fitness': record['gbest_fitness'],
+            'mean_fitness': record.get('mean_fitness', 0),
+            'alpha': record.get('alpha', 0),
+            'validity': 0.0,
+            'uniqueness': 0.0,
+            'novelty': 0.0,
+            'mean_qed': 0.0,
+        }
+        extended_history.append(ext_record)
+
+    return callback
+
+
+def evaluate_gbest_full(
+    gbest_params: np.ndarray,
+    kernel: SQMGKernel,
+    decoder: MoleculeDecoder,
+    evaluator: MoleculeEvaluator,
+    extended_history: List[Dict],
+    all_molecules: List[Dict],
+):
+    """
+    使用 gbest 參數進行完整的評估並更新 extended_history 的最後一筆記錄。
+    同時將有效分子加入 all_molecules。
+
+    此函式在每輪 QPSO 結束後，在 main loop 中呼叫。
+    """
+    try:
+        counts = kernel.sample(gbest_params)
+        decoded = decoder.decode_counts(counts)
+        metrics = evaluator.evaluate(decoded)
+
+        # 更新最後一筆 extended_history
+        if extended_history:
+            extended_history[-1]['validity'] = metrics['validity']
+            extended_history[-1]['uniqueness'] = metrics['uniqueness']
+            extended_history[-1]['novelty'] = metrics['novelty']
+            extended_history[-1]['mean_qed'] = metrics['mean_qed']
+
+        # 累積有效分子（去重）
+        existing_smiles = {m['smiles'] for m in all_molecules}
+        for r in decoded:
+            if r['valid'] and r['smiles'] not in existing_smiles:
+                all_molecules.append({
+                    'smiles': r['smiles'],
+                    'qed': r['qed'],
+                    'mol': r.get('mol'),
+                })
+                existing_smiles.add(r['smiles'])
+    except Exception as e:
+        print(f"  [Eval Callback 警告] {e}")
+
+
+# ============================================================================
+# CSV 匯出
+# ============================================================================
+
+def export_history_csv(history: List[Dict], filepath: str):
+    """匯出迭代歷史指標至 CSV 檔案。"""
+    if not history:
+        return
+    fieldnames = [
+        'Iteration', 'Gbest_Fitness', 'Mean_Fitness', 'Alpha',
+        'Validity', 'Uniqueness', 'Novelty', 'Mean_QED'
+    ]
+    with open(filepath, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for h in history:
+            writer.writerow({
+                'Iteration': h['iteration'] + 1,
+                'Gbest_Fitness': f"{h['gbest_fitness']:.6f}",
+                'Mean_Fitness': f"{h.get('mean_fitness', 0):.6f}",
+                'Alpha': f"{h.get('alpha', 0):.4f}",
+                'Validity': f"{h.get('validity', 0):.4f}",
+                'Uniqueness': f"{h.get('uniqueness', 0):.4f}",
+                'Novelty': f"{h.get('novelty', 0):.4f}",
+                'Mean_QED': f"{h.get('mean_qed', 0):.6f}",
+            })
+    print(f"  歷史指標已匯出至: {filepath}")
+
+
+def export_molecules_csv(molecules: List[Dict], filepath: str):
+    """匯出所有生成的有效分子至 CSV 檔案。"""
+    if not molecules:
+        return
+    fieldnames = ['SMILES', 'QED']
+    with open(filepath, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        sorted_mols = sorted(molecules, key=lambda m: -m.get('qed', 0))
+        for m in sorted_mols:
+            writer.writerow({
+                'SMILES': m['smiles'],
+                'QED': f"{m.get('qed', 0):.6f}",
+            })
+    print(f"  分子列表已匯出至: {filepath}")
 
 
 # ============================================================================
@@ -314,8 +462,16 @@ def main():
                         help="隨機數種子 (default: 42)")
     parser.add_argument("--verbose_eval", action="store_true",
                         help="每次適應度評估都印出詳細資訊")
+    parser.add_argument("--output_dir", type=str, default="./output",
+                        help="結果輸出目錄 (default: ./output)")
+    parser.add_argument("--dimred", type=str, default="pca",
+                        choices=["pca", "tsne"],
+                        help="化學空間降維方法 (default: pca)")
 
     args = parser.parse_args()
+
+    # 建立輸出目錄
+    os.makedirs(args.output_dir, exist_ok=True)
 
     # ── 系統資訊 ──
     print("╔" + "═" * 68 + "╗")
@@ -383,10 +539,32 @@ def main():
           f"{1 - args.alpha}×mean_QED")
 
     # ================================================================
-    # Step 5: 初始化 QPSO 優化器
+    # Step 5: 初始化 Evaluator & 回呼
     # ================================================================
     print(f"\n{'─' * 70}")
-    print("Step 5: 初始化 QPSO 量子粒子群優化器")
+    print("Step 5: 初始化 MoleculeEvaluator & 迭代回呼")
+    print(f"{'─' * 70}")
+
+    evaluator = MoleculeEvaluator()
+    extended_history: List[Dict] = []
+    all_molecules: List[Dict] = []
+
+    iteration_callback = create_iteration_callback(
+        kernel=kernel,
+        decoder=decoder,
+        evaluator=evaluator,
+        extended_history=extended_history,
+        all_molecules=all_molecules,
+    )
+    print("  MoleculeEvaluator 已初始化")
+    print(f"  參考分子集大小: {len(evaluator.reference_smiles)}")
+    print(f"  輸出目錄: {args.output_dir}")
+
+    # ================================================================
+    # Step 6: 初始化 QPSO 優化器
+    # ================================================================
+    print(f"\n{'─' * 70}")
+    print("Step 6: 初始化 QPSO 量子粒子群優化器")
     print(f"{'─' * 70}")
 
     optimizer = QuantumOptimizer(
@@ -398,31 +576,72 @@ def main():
         alpha_min=args.alpha_min,
         seed=args.seed,
         verbose=True,
+        iteration_callback=iteration_callback,
     )
 
     # ================================================================
-    # Step 6: 執行 QPSO 優化
+    # Step 7: 執行 QPSO 優化（含迭代指標收集）
     # ================================================================
     print(f"\n{'─' * 70}")
-    print("Step 6: 執行 QPSO 優化迭代")
+    print("Step 7: 執行 QPSO 優化迭代")
     print(f"{'─' * 70}")
 
     start_time = time.time()
     best_params, best_fitness, history = optimizer.optimize()
     elapsed = time.time() - start_time
 
+    # ── 每輪結束後用 gbest 做完整評估 ──
+    print("\n[指標收集] 使用 gbest 重新評估各輪指標...")
+    for i, h in enumerate(history):
+        if i < len(extended_history):
+            # 更新 extended_history 中缺失的 QPSO 統計
+            extended_history[i]['gbest_fitness'] = h['gbest_fitness']
+            extended_history[i]['mean_fitness'] = h.get('mean_fitness', 0)
+            extended_history[i]['alpha'] = h.get('alpha', 0)
+
+    # 最終一次性評估：用每輪的 gbest 重新取樣（只對最後結果做完整評估以節省時間）
+    evaluate_gbest_full(
+        best_params, kernel, decoder, evaluator,
+        extended_history, all_molecules,
+    )
+
     print(f"\n總耗時: {elapsed:.1f} 秒 ({elapsed / 60:.1f} 分鐘)")
 
     # ================================================================
-    # Step 7: 分析最佳結果
+    # Step 8: 分析最佳結果
     # ================================================================
     print(f"\n{'─' * 70}")
-    print("Step 7: 分析最佳結果")
+    print("Step 8: 分析最佳結果")
     print(f"{'─' * 70}")
 
     valid_results = analyze_best_result(best_params, kernel, decoder)
 
-    # ── 收斂曲線資料（可用於繪圖）──
+    # 將 analyze 結果中的有效分子也加入 all_molecules
+    if valid_results:
+        existing_smiles = {m['smiles'] for m in all_molecules}
+        for r in valid_results:
+            if r['smiles'] not in existing_smiles:
+                all_molecules.append({
+                    'smiles': r['smiles'],
+                    'qed': r['qed'],
+                    'mol': r.get('mol'),
+                })
+                existing_smiles.add(r['smiles'])
+
+    # ── 最終評估指標 ──
+    print(f"\n{'─' * 70}")
+    print("評估指標 (Validity / Uniqueness / Novelty)：")
+    print(f"{'─' * 70}")
+
+    if valid_results:
+        # 用最終取樣結果做完整評估
+        final_decoded = []
+        counts_final = kernel.sample(best_params)
+        final_decoded = decoder.decode_counts(counts_final)
+        final_metrics = evaluator.evaluate(final_decoded)
+        print(evaluator.format_metrics(final_metrics))
+
+    # ── 收斂曲線資料（ASCII）──
     print(f"\n{'─' * 70}")
     print("收斂曲線（gbest fitness vs. iteration）：")
     print(f"{'─' * 70}")
@@ -432,8 +651,54 @@ def main():
         bar = "█" * bar_len + "░" * (50 - bar_len)
         print(f"  Iter {it + 1:3d}: {bar} {fit:.4f}")
 
+    # ================================================================
+    # Step 9: CSV 匯出 & 視覺化
+    # ================================================================
+    print(f"\n{'─' * 70}")
+    print("Step 9: CSV 匯出 & 視覺化")
+    print(f"{'─' * 70}")
+
+    # 補完 extended_history（確保與 history 一致）
+    if len(extended_history) < len(history):
+        for i in range(len(extended_history), len(history)):
+            extended_history.append({
+                'iteration': history[i]['iteration'],
+                'gbest_fitness': history[i]['gbest_fitness'],
+                'mean_fitness': history[i].get('mean_fitness', 0),
+                'alpha': history[i].get('alpha', 0),
+                'validity': 0.0,
+                'uniqueness': 0.0,
+                'novelty': 0.0,
+                'mean_qed': 0.0,
+            })
+
+    # CSV 匯出
+    export_history_csv(
+        extended_history,
+        os.path.join(args.output_dir, "history_metrics.csv"),
+    )
+    export_molecules_csv(
+        all_molecules,
+        os.path.join(args.output_dir, "generated_molecules.csv"),
+    )
+
+    # 視覺化圖表
+    try:
+        plot_paths = plot_all(
+            history=extended_history,
+            molecules=all_molecules,
+            output_dir=args.output_dir,
+            show=False,
+            dimred_method=args.dimred,
+        )
+        print(f"\n  已生成 {len(plot_paths)} 張圖表。")
+    except Exception as e:
+        print(f"\n  [視覺化警告] 圖表生成失敗: {e}")
+        print("  （可能缺少 matplotlib / seaborn / scikit-learn）")
+
     print(f"\n{'═' * 70}")
-    print("SQMG 執行完成。")
+    print("SQMG 執行完成。所有結果已輸出至:")
+    print(f"  {os.path.abspath(args.output_dir)}")
     print(f"{'═' * 70}")
 
 

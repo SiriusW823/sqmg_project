@@ -8,3 +8,8 @@
 numpy>=1.24,<2.0
 rdkit>=2023.9.1
 cuda-quantum>=0.6.0
+
+# v3: 視覺化 & 評估
+matplotlib>=3.7
+seaborn>=0.12
+scikit-learn>=1.2

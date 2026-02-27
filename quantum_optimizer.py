@@ -48,7 +48,7 @@ QuantumOptimizer — 量子粒子群優化 (QPSO) 演算法
 ■ QPSO 與 CUDA-Q kernel 參數的互動
   ──────────────────────────────────
   • 每個「粒子」代表一組量子線路旋轉角度 θ = [θ₀, θ₁, ..., θ_{D-1}]
-    其中 D = 10N − 4（N 為重原子數量）。
+    其中 D = 5N − 2（N 為重原子數量）。
   • 在每一輪迭代中：
     1. 將粒子位置（參數陣列）傳入 CUDA-Q kernel
     2. kernel 使用這些角度執行參數化量子線路
@@ -72,7 +72,7 @@ class QuantumOptimizer:
 
     使用方式：
         optimizer = QuantumOptimizer(
-            n_params=36,          # 10N-4, N=4
+            n_params=18,          # 5N-2, N=4
             n_particles=20,
             max_iterations=50,
             fitness_fn=my_fitness_function,
@@ -92,12 +92,13 @@ class QuantumOptimizer:
         param_upper: float = np.pi,
         seed: Optional[int] = None,
         verbose: bool = True,
+        iteration_callback: Optional[Callable[[int, dict], None]] = None,
     ):
         """
         初始化 QPSO 優化器。
 
         Args:
-            n_params:        參數空間維度 D（= 10N − 4）
+            n_params:        參數空間維度 D（= 5N − 2）
             n_particles:     粒子數量 M（建議 15~30）
             max_iterations:  最大迭代次數 T
             fitness_fn:      適應度函式 f(params) → float
@@ -108,6 +109,8 @@ class QuantumOptimizer:
             param_upper:     參數上界（所有維度共用）
             seed:            隨機數種子（可重現性）
             verbose:         是否印出每輪進度
+            iteration_callback: 可選回呼函式 f(iteration, record) → None
+                             每輪迭代結束後呼叫，用於外部指標收集
         """
         self.D = n_params
         self.M = n_particles
@@ -118,6 +121,8 @@ class QuantumOptimizer:
         self.lb = param_lower
         self.ub = param_upper
         self.verbose = verbose
+
+        self.iteration_callback = iteration_callback
 
         # 隨機數生成器（支援可重現性）
         self.rng = np.random.default_rng(seed)
@@ -336,6 +341,14 @@ class QuantumOptimizer:
                 'std_fitness': float(np.std(iteration_fitnesses)),
             }
             self.history.append(iter_record)
+
+            # ── 回呼（外部指標收集，如 Evaluator 指標）──
+            if self.iteration_callback is not None:
+                try:
+                    self.iteration_callback(t, iter_record)
+                except Exception as e:
+                    if self.verbose:
+                        print(f"  [Callback 警告] {e}")
 
             # ── 進度輸出 ──
             if self.verbose:
