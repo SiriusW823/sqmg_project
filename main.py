@@ -73,7 +73,7 @@ except ImportError:
 # ── 本地模組 Import ──
 from sqmg_kernel import SQMGKernel
 from molecule_decoder import MoleculeDecoder
-from quantum_optimizer import QuantumOptimizer
+from quantum_optimizer import QuantumOptimizer, ParetoArchive
 from evaluator import MoleculeEvaluator
 from plot_utils import plot_all
 
@@ -118,6 +118,7 @@ def create_fitness_function(
     decoder: MoleculeDecoder,
     alpha: float = 0.4,
     verbose_eval: bool = False,
+    pareto_archive: 'ParetoArchive | None' = None,
 ):
     """
     建立連接 CUDA-Q kernel ↔ MoleculeDecoder ↔ QPSO 的適應度函式。
@@ -125,19 +126,22 @@ def create_fitness_function(
     閉包 (Closure) 內封裝了 kernel 與 decoder 的參考，
     使 QPSO 只需要傳入參數向量即可得到適應度分數。
 
-    適應度定義：
-        fitness = α × validity_ratio + (1 − α) × mean_qed
+    v4 新增：
+      • Fitness = w1×QED + w2×SA + w3×Size_Reward + w4×Connectivity − Penalty
+        （實際由 decoder._score_molecule 內部計算）
+      • 若提供 pareto_archive，每次評估自動更新非支配解存檔
 
     Args:
-        kernel:       SQMGKernel 實例
-        decoder:      MoleculeDecoder 實例
-        alpha:        validity_ratio 的權重（0~1）
-        verbose_eval: 若 True，每次評估都印出詳細結果
+        kernel:         SQMGKernel 實例
+        decoder:        MoleculeDecoder 實例
+        alpha:          shaping vs QED 的權重（0~1）
+        verbose_eval:   若 True，每次評估都印出詳細結果
+        pareto_archive: Pareto 非支配解存檔（可選）
 
     Returns:
         fitness_fn: Callable[[np.ndarray], float]
     """
-    eval_count = [0]  # 使用 list 以便在閉包中修改
+    eval_count = [0]
 
     def fitness_fn(params: np.ndarray) -> float:
         """
@@ -146,8 +150,9 @@ def create_fitness_function(
         流程：
         1. params → CUDA-Q kernel (cudaq.sample)
         2. bit-strings → MoleculeDecoder
-        3. 分子 → RDKit → Validity + QED
+        3. 分子 → RDKit → Validity + QED + SA + Size + Penalty
         4. → fitness score
+        5. (可選) 更新 Pareto Archive
         """
         eval_count[0] += 1
 
@@ -167,10 +172,34 @@ def create_fitness_function(
                     f"Fitness={fitness:.6f}"
                 )
 
+            # ── Step 3 (v4): 更新 Pareto Archive ──
+            if pareto_archive is not None and decoded:
+                valid = [
+                    r for r in decoded
+                    if r.get('valid') and not r.get('partial_valid')
+                ]
+                n_total = len(decoded)
+                if valid:
+                    qeds = [r['qed'] for r in valid]
+                    validity = len(valid) / n_total
+                    unique_smi = list({r['smiles'] for r in valid
+                                       if r.get('smiles')})
+                    uniqueness = (
+                        len(unique_smi) / len(valid) if len(valid) > 0 else 0
+                    )
+                    pareto_archive.try_add(
+                        params=params,
+                        objectives={
+                            'mean_qed': float(np.mean(qeds)),
+                            'val_x_uniq': validity * uniqueness,
+                        },
+                        fitness=fitness,
+                        smiles=unique_smi,
+                    )
+
             return fitness
 
         except Exception as e:
-            # 任何未預期的錯誤都安全地回傳 0 分
             if verbose_eval:
                 print(f"    [Eval #{eval_count[0]}] 錯誤: {e}")
             return 0.0
@@ -325,6 +354,31 @@ def export_molecules_csv(molecules: List[Dict], filepath: str):
                 'QED': f"{m.get('qed', 0):.6f}",
             })
     print(f"  分子列表已匯出至: {filepath}")
+
+
+def export_archive_csv(archive: ParetoArchive, filepath: str):
+    """匯出 Pareto Archive 非支配解至 CSV 檔案。"""
+    front = archive.get_pareto_front()
+    if not front:
+        return
+    fieldnames = ['Rank', 'Fitness', 'Mean_QED', 'Val_x_Uniq',
+                  'N_Molecules', 'Top_SMILES']
+    with open(filepath, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        sorted_front = sorted(front, key=lambda x: -x['fitness'])
+        for rank, entry in enumerate(sorted_front, 1):
+            obj = entry.get('objectives', {})
+            smiles_list = entry.get('smiles', [])
+            writer.writerow({
+                'Rank': rank,
+                'Fitness': f"{entry['fitness']:.6f}",
+                'Mean_QED': f"{obj.get('mean_qed', 0):.6f}",
+                'Val_x_Uniq': f"{obj.get('val_x_uniq', 0):.6f}",
+                'N_Molecules': len(smiles_list),
+                'Top_SMILES': '; '.join(smiles_list[:5]),
+            })
+    print(f"  Pareto Archive 已匯出至: {filepath}")
 
 
 # ============================================================================
@@ -537,14 +591,21 @@ def main():
     print("Step 4: 建立適應度函式")
     print(f"{'─' * 70}")
 
+    pareto_archive = ParetoArchive(
+        max_size=100,
+        objectives=('mean_qed', 'val_x_uniq'),
+    )
+
     fitness_fn = create_fitness_function(
         kernel=kernel,
         decoder=decoder,
         alpha=args.alpha,
         verbose_eval=args.verbose_eval,
+        pareto_archive=pareto_archive,
     )
-    print(f"  適應度公式: fitness = {args.alpha}×validity + "
-          f"{1 - args.alpha}×mean_QED")
+    print(f"  Fitness = w1×QED + w2×SA + w3×Size_Reward + w4×Conn − Penalty")
+    print(f"  Alpha (探索 vs 利用): {args.alpha}")
+    print(f"  Pareto Archive 已初始化 (max_size=100, obj=mean_qed × val×uniq)")
 
     # ================================================================
     # Step 5: 初始化 Evaluator & 回呼
@@ -663,6 +724,16 @@ def main():
         all_molecules,
         os.path.join(args.output_dir, "generated_molecules.csv"),
     )
+    export_archive_csv(
+        pareto_archive,
+        os.path.join(args.output_dir, "pareto_archive.csv"),
+    )
+
+    # Pareto Archive 摘要
+    print(f"\n{'\u2500' * 70}")
+    print("Pareto Archive (非支配解)\uff1a")
+    print(f"{'\u2500' * 70}")
+    print(pareto_archive.summary())
 
     # 視覺化圖表
     try:

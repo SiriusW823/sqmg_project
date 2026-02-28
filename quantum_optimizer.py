@@ -57,8 +57,168 @@ QuantumOptimizer — 量子粒子群優化 (QPSO) 演算法  v3
 
 import math
 import numpy as np
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
+
+# ============================================================================
+# Pareto Archive — 多目標非支配解外部存檔
+# ============================================================================
+
+class ParetoArchive:
+    """
+    外部存檔 (External Archive) — 記錄 QPSO 搜尋過程中的非支配解。
+
+    在多目標最佳化中，不同解可能在「QED 高但 Uniqueness 低」
+    或「QED 低但 Uniqueness 高」之間權衡。Pareto Archive 保存
+    所有「不被其他解支配」的解，形成 Pareto 前緣 (Pareto Frontier)。
+
+    支配關係定義：
+      解 A 支配 (dominates) 解 B ⟺
+        ∀i: A_i ≥ B_i  且  ∃j: A_j > B_j
+      （A 在所有目標上不差，且至少一個目標嚴格更好）
+
+    預設目標軸：
+      1. mean_qed      — 平均 QED 分數（越高越好）
+      2. val_x_uniq    — Validity × Uniqueness（越高越好）
+
+    使用方式：
+        archive = ParetoArchive(max_size=100)
+        archive.try_add(
+            params=params_vector,
+            objectives={'mean_qed': 0.45, 'val_x_uniq': 0.72},
+            fitness=0.61,
+            smiles=['CCO', 'CC=O'],
+        )
+        print(archive.summary())
+    """
+
+    def __init__(
+        self,
+        max_size: int = 100,
+        objectives: Tuple[str, ...] = ('mean_qed', 'val_x_uniq'),
+    ):
+        """
+        Args:
+            max_size:   存檔最大容量（超出後按 fitness 降序截斷）
+            objectives: 目標維度名稱（皆為越大越好）
+        """
+        self.max_size = max_size
+        self.obj_keys = objectives
+        self.archive: List[Dict] = []
+
+    # ────────────────────────────────────────────────────────────
+
+    def try_add(
+        self,
+        params: np.ndarray,
+        objectives: Dict[str, float],
+        fitness: float,
+        smiles: List[str],
+    ) -> bool:
+        """
+        嘗試將一組解加入存檔。
+
+        流程：
+        1. 計算新解的目標向量
+        2. 檢查是否被任何現有解支配 → 若是則拒絕
+        3. 移除被新解支配的現有解
+        4. 加入新解
+        5. 若超出容量 → 按 fitness 截斷
+
+        Args:
+            params:     量子線路參數向量
+            objectives: 目標字典，須包含 self.obj_keys 中的所有 key
+            fitness:    標量適應度（用於容量截斷時排序）
+            smiles:     本次生成的有效 SMILES 列表
+
+        Returns:
+            True 表示成功加入，False 表示被支配而拒絕
+        """
+        obj_vec = tuple(objectives.get(k, 0.0) for k in self.obj_keys)
+
+        # 檢查是否被現有解支配 & 移除被新解支配的舊解
+        new_archive: List[Dict] = []
+        dominated = False
+
+        for entry in self.archive:
+            exist_vec = entry['obj_vec']
+            if self._dominates(exist_vec, obj_vec):
+                dominated = True
+                break
+            if not self._dominates(obj_vec, exist_vec):
+                new_archive.append(entry)
+
+        if dominated:
+            return False
+
+        # 加入新解
+        new_archive.append({
+            'params': params.copy() if hasattr(params, 'copy') else params,
+            'objectives': dict(objectives),
+            'obj_vec': obj_vec,
+            'fitness': fitness,
+            'smiles': list(smiles),
+        })
+
+        # 容量截斷
+        if len(new_archive) > self.max_size:
+            new_archive.sort(key=lambda x: -x['fitness'])
+            new_archive = new_archive[:self.max_size]
+
+        self.archive = new_archive
+        return True
+
+    # ────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _dominates(a: tuple, b: tuple) -> bool:
+        """
+        判斷目標向量 a 是否支配 b。
+
+        支配條件：a 在所有維度 ≥ b，且至少一個維度 > b。
+        """
+        all_ge = all(ai >= bi for ai, bi in zip(a, b))
+        any_gt = any(ai > bi for ai, bi in zip(a, b))
+        return all_ge and any_gt
+
+    def get_pareto_front(self) -> List[Dict]:
+        """回傳目前 Pareto 前緣的所有解（副本）。"""
+        return [dict(e) for e in self.archive]
+
+    def __len__(self) -> int:
+        return len(self.archive)
+
+    def summary(self) -> str:
+        """產生 Pareto Archive 的文字摘要。"""
+        if not self.archive:
+            return "  Pareto Archive: empty (0 non-dominated solutions)"
+
+        lines = [
+            f"  Pareto Archive: {len(self.archive)} non-dominated solutions",
+            f"  Objectives: {', '.join(self.obj_keys)}",
+        ]
+
+        # 按 fitness 降序列出前 5 名
+        top = sorted(self.archive, key=lambda x: -x['fitness'])[:5]
+        for i, entry in enumerate(top, 1):
+            obj_str = ", ".join(
+                f"{k}={entry['objectives'].get(k, 0):.4f}"
+                for k in self.obj_keys
+            )
+            n_smi = len(entry['smiles'])
+            best_smi = entry['smiles'][0] if entry['smiles'] else '?'
+            lines.append(
+                f"    #{i}: [{obj_str}] "
+                f"fitness={entry['fitness']:.4f}  "
+                f"({n_smi} mols, e.g. {best_smi})"
+            )
+
+        return "\n".join(lines)
+
+
+# ============================================================================
+# QuantumOptimizer — QPSO 量子粒子群優化
+# ============================================================================
 
 class QuantumOptimizer:
     """
