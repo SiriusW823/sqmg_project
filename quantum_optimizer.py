@@ -1,57 +1,52 @@
 """
 ==============================================================================
-QuantumOptimizer — 量子粒子群優化 (QPSO) 演算法  v3
+MOQPSOOptimizer — 多目標量子粒子群優化 (MOQPSO) v5
 ==============================================================================
 
-本模組實作 Quantum Particle Swarm Optimization (QPSO)，
-用來最大化分子生成的 Validity 與 QED 分數。
+本模組實作 Multi-Objective Quantum Particle Swarm Optimization (MOQPSO)，
+用來「同時最大化」分子生成的 Validity（有效性）與 Uniqueness（唯一性）。
 
-■ 為什麼用 QPSO 而非傳統 BO？
-  ─ 原始 QMG 論文使用 GPEI / SAASBO 等貝葉斯優化 (BO)。
-  ─ 本專案（SQMG）的核心創新之一是採用「全量子優化器」。
-  ─ QPSO 基於量子力學的 Delta 勢阱模型與薛丁格方程式的
-    機率分佈來更新粒子位置，無須計算梯度，適合處理
-    「非連續 / 高維 / 多模態」的量子線路參數搜尋空間。
+■ 為什麼升級為 MOQPSO？
+  ─ v3 QPSO 使用單一 gbest 追蹤標量適應度，
+    無法在 Validity 與 Uniqueness 之間自動權衡。
+  ─ MOQPSO 使用 **Pareto Archive** 取代固定 gbest：
+    • 非支配解外部存檔（支配關係判定）
+    • 擁擠距離 (Crowding Distance) 輪盤選擇 Archive Leader
+    • pbest 更新遵循 Pareto 支配規則
+  ─ 保留 v3 的抗停滯機制（Cosine α、Cauchy 變異、停滯偵測）。
 
-■ QPSO 核心數學
-  ─────────────
-  1. mbest（Mean Best Position，平均最佳位置）：
+■ MOQPSO 核心數學
+  ─────────────────
+  1. mbest（平均最佳位置）：
          mbest_d = (1/M) × Σᵢ pbest_i,d
 
-  2. 局部吸引子 (Local Attractor)：
-         p_i,d = φ × pbest_i,d + (1 − φ) × gbest_d
+  2. 局部吸引子（Archive-guided）：
+         guide  ← ParetoArchive.select_leader（擁擠距離輪盤）
+         p_i,d  = φ × pbest_i,d + (1 − φ) × guide_d
          φ ~ Uniform(0, 1)
 
   3. 位置更新（Delta 勢阱模型）：
-         x_i,d = p_i,d ± α × |mbest_d − x_i,d| × ln(1/u)
+         x_i,d  = p_i,d ± α × |mbest_d − x_i,d| × ln(1/u)
          u ~ Uniform(0, 1)
 
-  4. 收縮-擴張係數 α：控制探索 vs 利用的平衡。
+  4. pbest 更新（Pareto 支配規則）：
+         ─ 新解支配舊 pbest → 更新
+         ─ 舊 pbest 支配新解 → 保留
+         ─ 互不支配 → 50% 機率替換
 
-■ v3 新增三大抗停滯機制
-  ────────────────────
-  1. 非線性 α 排程：Cosine Annealing + 隨機擾動 + 停滯提升
-     α(t) = α_min + ½(α_max − α_min)(1 + cos(πt/T)) + perturbation
+  5. Archive 更新：
+         每次評估都嘗試 try_add，移除被支配解，
+         超出容量時按擁擠距離截斷。
 
-  2. Cauchy 變異 (Mutation)：以機率 p_mut 對粒子施加
-     Cauchy 分佈的跳躍變異，提供比 Gaussian 更重尾的探索。
-     對 gbest 也定期施加變異以探索鄰近盆地。
+■ 目標軸定義
+  ───────────
+  1. validity   — RDKit SanitizeMol 成功的 bit-string 比例
+  2. uniqueness — 有效分子中不重複 SMILES 的比例
 
-  3. 停滯偵測 & 部分重初始化：
-     連續 N_stag 代 gbest 未改善 → 對最差 reinit_frac 粒子
-     進行隨機重初始化，並暫時提升 α 以脫離局部最優。
-
-■ QPSO 與 CUDA-Q kernel 參數的互動
-  ──────────────────────────────────
-  • 每個「粒子」代表一組量子線路旋轉角度 θ = [θ₀, θ₁, ..., θ_{D-1}]
-    其中 D = 5N − 2（N 為重原子數量）。
-  • 在每一輪迭代中：
-    1. 將粒子位置（參數陣列）傳入 CUDA-Q kernel
-    2. kernel 使用這些角度執行參數化量子線路
-    3. cudaq.sample() 回傳 bit-string 計數
-    4. MoleculeDecoder 將 bit-strings 解碼為分子
-    5. 計算適應度（Shaping Reward）
-    6. QPSO 根據適應度更新粒子位置（不需要梯度！）
+■ fitness_fn 回傳值
+  ──────────────────
+  fitness_fn(params) → Tuple[float, float]  即 (validity, uniqueness)
+  （不再是單一標量！）
 ==============================================================================
 """
 
@@ -61,15 +56,15 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 
 # ============================================================================
-# Pareto Archive — 多目標非支配解外部存檔
+# Pareto Archive — 多目標非支配解外部存檔（含擁擠距離）
 # ============================================================================
 
 class ParetoArchive:
     """
-    外部存檔 (External Archive) — 記錄 QPSO 搜尋過程中的非支配解。
+    外部存檔 (External Archive) — 記錄搜尋過程中的非支配解。
 
-    在多目標最佳化中，不同解可能在「QED 高但 Uniqueness 低」
-    或「QED 低但 Uniqueness 高」之間權衡。Pareto Archive 保存
+    在多目標最佳化中，不同解可能在 Validity 高但 Uniqueness 低，
+    或 Validity 低但 Uniqueness 高之間權衡。Pareto Archive 保存
     所有「不被其他解支配」的解，形成 Pareto 前緣 (Pareto Frontier)。
 
     支配關係定義：
@@ -77,29 +72,34 @@ class ParetoArchive:
         ∀i: A_i ≥ B_i  且  ∃j: A_j > B_j
       （A 在所有目標上不差，且至少一個目標嚴格更好）
 
-    預設目標軸：
-      1. mean_qed      — 平均 QED 分數（越高越好）
-      2. val_x_uniq    — Validity × Uniqueness（越高越好）
+    目標軸：
+      1. validity   — RDKit 解析成功比例（越高越好）
+      2. uniqueness — 有效分子唯一性比例（越高越好）
+
+    擁擠距離 (Crowding Distance)：
+      衡量每個解在 Pareto 前緣上的「稀疏程度」。
+      擁擠距離越大 → 解越孤立 → 被選為 Leader 的機率越高
+      → 促進粒子群的多樣性探索。
 
     使用方式：
         archive = ParetoArchive(max_size=100)
         archive.try_add(
             params=params_vector,
-            objectives={'mean_qed': 0.45, 'val_x_uniq': 0.72},
-            fitness=0.61,
+            objectives={'validity': 0.72, 'uniqueness': 0.85},
             smiles=['CCO', 'CC=O'],
         )
+        guide = archive.select_leader(rng)
         print(archive.summary())
     """
 
     def __init__(
         self,
         max_size: int = 100,
-        objectives: Tuple[str, ...] = ('mean_qed', 'val_x_uniq'),
+        objectives: Tuple[str, ...] = ('validity', 'uniqueness'),
     ):
         """
         Args:
-            max_size:   存檔最大容量（超出後按 fitness 降序截斷）
+            max_size:   存檔最大容量（超出後按擁擠距離截斷）
             objectives: 目標維度名稱（皆為越大越好）
         """
         self.max_size = max_size
@@ -112,31 +112,34 @@ class ParetoArchive:
         self,
         params: np.ndarray,
         objectives: Dict[str, float],
-        fitness: float,
-        smiles: List[str],
+        smiles: Optional[List[str]] = None,
     ) -> bool:
         """
         嘗試將一組解加入存檔。
 
         流程：
         1. 計算新解的目標向量
-        2. 檢查是否被任何現有解支配 → 若是則拒絕
-        3. 移除被新解支配的現有解
-        4. 加入新解
-        5. 若超出容量 → 按 fitness 截斷
+        2. 跳過平凡解（所有目標 ≤ 0）
+        3. 檢查是否被任何現有解支配 → 若是則拒絕
+        4. 移除被新解支配的現有解
+        5. 加入新解
+        6. 若超出容量 → 按擁擠距離截斷
 
         Args:
             params:     量子線路參數向量
             objectives: 目標字典，須包含 self.obj_keys 中的所有 key
-            fitness:    標量適應度（用於容量截斷時排序）
-            smiles:     本次生成的有效 SMILES 列表
+            smiles:     本次生成的有效 SMILES 列表（可選）
 
         Returns:
             True 表示成功加入，False 表示被支配而拒絕
         """
         obj_vec = tuple(objectives.get(k, 0.0) for k in self.obj_keys)
 
-        # 檢查是否被現有解支配 & 移除被新解支配的舊解
+        # 跳過全零/全負解（沒有任何有效分子）
+        if all(v <= 0.0 for v in obj_vec):
+            return False
+
+        # 檢查支配關係 & 移除被新解支配的舊解
         new_archive: List[Dict] = []
         dominated = False
 
@@ -147,23 +150,28 @@ class ParetoArchive:
                 break
             if not self._dominates(obj_vec, exist_vec):
                 new_archive.append(entry)
+            # else: obj_vec dominates exist_vec → 移除舊解
 
         if dominated:
             return False
 
         # 加入新解
         new_archive.append({
-            'params': params.copy() if hasattr(params, 'copy') else params,
+            'params': params.copy() if hasattr(params, 'copy') else np.array(params),
             'objectives': dict(objectives),
             'obj_vec': obj_vec,
-            'fitness': fitness,
-            'smiles': list(smiles),
+            'smiles': list(smiles) if smiles else [],
         })
 
-        # 容量截斷
+        # 容量截斷：按擁擠距離降序保留 max_size 個
         if len(new_archive) > self.max_size:
-            new_archive.sort(key=lambda x: -x['fitness'])
-            new_archive = new_archive[:self.max_size]
+            distances = self._compute_crowding_distances(new_archive)
+            # 擁擠距離大的保留（邊界解 inf 永遠保留）
+            indexed = sorted(
+                range(len(new_archive)),
+                key=lambda i: -distances[i],
+            )
+            new_archive = [new_archive[i] for i in indexed[:self.max_size]]
 
         self.archive = new_archive
         return True
@@ -181,12 +189,127 @@ class ParetoArchive:
         any_gt = any(ai > bi for ai, bi in zip(a, b))
         return all_ge and any_gt
 
+    # ────────────────────────────────────────────────────────────
+    # 擁擠距離 (Crowding Distance)
+    # ────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _compute_crowding_distances(entries: List[Dict]) -> List[float]:
+        """
+        計算每個解在 Pareto 前緣上的擁擠距離。
+
+        對每個目標維度 m：
+          1. 按目標值排序
+          2. 兩端邊界解設為 ∞
+          3. 中間解 = (左鄰 − 右鄰) / 目標值域
+
+        最終擁擠距離 = 各維度之和。
+
+        擁擠距離大 → 解位於 Pareto 前緣的稀疏區域
+        擁擠距離小 → 解被其他解包圍
+
+        Returns:
+            各解的擁擠距離列表
+        """
+        n = len(entries)
+        if n == 0:
+            return []
+        if n <= 2:
+            return [float('inf')] * n
+
+        n_obj = len(entries[0]['obj_vec'])
+        distances = [0.0] * n
+
+        for m in range(n_obj):
+            # 按第 m 個目標值排序
+            sorted_idx = sorted(
+                range(n), key=lambda i: entries[i]['obj_vec'][m]
+            )
+
+            # 邊界解設為 ∞
+            distances[sorted_idx[0]] = float('inf')
+            distances[sorted_idx[-1]] = float('inf')
+
+            # 目標值域
+            f_max = entries[sorted_idx[-1]]['obj_vec'][m]
+            f_min = entries[sorted_idx[0]]['obj_vec'][m]
+            obj_range = f_max - f_min
+            if obj_range < 1e-12:
+                continue
+
+            # 中間解的擁擠距離
+            for k in range(1, n - 1):
+                prev_val = entries[sorted_idx[k - 1]]['obj_vec'][m]
+                next_val = entries[sorted_idx[k + 1]]['obj_vec'][m]
+                distances[sorted_idx[k]] += (next_val - prev_val) / obj_range
+
+        return distances
+
+    # ────────────────────────────────────────────────────────────
+    # Archive Leader 選擇（擁擠距離輪盤）
+    # ────────────────────────────────────────────────────────────
+
+    def select_leader(self, rng: np.random.Generator) -> Optional[np.ndarray]:
+        """
+        從 Archive 中以擁擠距離為權重進行輪盤選擇，
+        取出一組參數作為粒子的吸引子 (guide)。
+
+        擁擠距離越大 → 被選中機率越高
+        → 促使粒子群探索 Pareto 前緣的不同區域。
+
+        Args:
+            rng: NumPy 隨機數生成器
+
+        Returns:
+            選中解的參數向量 (D,)，若 Archive 為空則回傳 None
+        """
+        if not self.archive:
+            return None
+        if len(self.archive) == 1:
+            return self.archive[0]['params'].copy()
+
+        distances = self._compute_crowding_distances(self.archive)
+
+        # ∞ 替換為有限最大值的 2 倍（確保邊界解高機率被選）
+        max_finite = max(
+            (d for d in distances if d != float('inf')),
+            default=1.0,
+        )
+        weights = [
+            d if d != float('inf') else max_finite * 2.0
+            for d in distances
+        ]
+
+        total = sum(weights)
+        if total < 1e-12:
+            idx = rng.integers(0, len(self.archive))
+        else:
+            probs = np.array(weights) / total
+            idx = rng.choice(len(self.archive), p=probs)
+
+        return self.archive[idx]['params'].copy()
+
+    # ────────────────────────────────────────────────────────────
+    # 查詢工具
+    # ────────────────────────────────────────────────────────────
+
     def get_pareto_front(self) -> List[Dict]:
         """回傳目前 Pareto 前緣的所有解（副本）。"""
         return [dict(e) for e in self.archive]
 
     def __len__(self) -> int:
         return len(self.archive)
+
+    def best_compromise(self) -> Optional[Dict]:
+        """
+        回傳「折中最優解」— 目標向量元素和最大的解。
+
+        在 (validity, uniqueness) 空間中，折中最優 =
+        validity + uniqueness 最大的非支配解。
+        """
+        if not self.archive:
+            return None
+        return max(self.archive, key=lambda e: sum(e['obj_vec']))
 
     def summary(self) -> str:
         """產生 Pareto Archive 的文字摘要。"""
@@ -198,18 +321,17 @@ class ParetoArchive:
             f"  Objectives: {', '.join(self.obj_keys)}",
         ]
 
-        # 按 fitness 降序列出前 5 名
-        top = sorted(self.archive, key=lambda x: -x['fitness'])[:5]
+        # 按折中分數（目標和）降序列出前 5 名
+        top = sorted(self.archive, key=lambda x: -sum(x['obj_vec']))[:5]
         for i, entry in enumerate(top, 1):
             obj_str = ", ".join(
                 f"{k}={entry['objectives'].get(k, 0):.4f}"
                 for k in self.obj_keys
             )
-            n_smi = len(entry['smiles'])
-            best_smi = entry['smiles'][0] if entry['smiles'] else '?'
+            n_smi = len(entry.get('smiles', []))
+            best_smi = entry['smiles'][0] if entry.get('smiles') else '?'
             lines.append(
-                f"    #{i}: [{obj_str}] "
-                f"fitness={entry['fitness']:.4f}  "
+                f"    #{i}: [{obj_str}]  "
                 f"({n_smi} mols, e.g. {best_smi})"
             )
 
@@ -217,29 +339,29 @@ class ParetoArchive:
 
 
 # ============================================================================
-# QuantumOptimizer — QPSO 量子粒子群優化
+# MOQPSOOptimizer — 多目標量子粒子群優化
 # ============================================================================
 
-class QuantumOptimizer:
+class MOQPSOOptimizer:
     """
-    QPSO (Quantum Particle Swarm Optimization) 優化器 — v3 抗停滯版。
+    MOQPSO (Multi-Objective Quantum Particle Swarm Optimization) — v5。
 
-    相對於 v1/v2 的改進：
-      • Cosine Annealing α 排程（替代線性遞減）
-      • Cauchy 變異機制（重尾探索）
-      • 停滯偵測 + 部分粒子重初始化
-      • 多樣性監控指標
+    相對於 v3 單目標 QPSO 的核心改動：
+      • fitness_fn 回傳 (validity, uniqueness) 元組（非標量）
+      • 移除固定 gbest：改用 ParetoArchive 的擁擠距離輪盤選擇 Leader
+      • pbest 更新：Pareto 支配規則 + 50% 隨機替換
+      • 保留 v3 的 Cosine Annealing α、Cauchy 變異、停滯偵測
 
     使用方式：
-        optimizer = QuantumOptimizer(
-            n_params=18,            # 5N-2, N=4
+        archive = ParetoArchive(max_size=100)
+        optimizer = MOQPSOOptimizer(
+            n_params=18,
             n_particles=20,
             max_iterations=50,
-            fitness_fn=my_fitness_function,
-            stagnation_limit=5,     # 連續 5 代未改善就觸發重初始化
-            mutation_prob=0.15,     # 15% 機率施加 Cauchy 變異
+            fitness_fn=my_fn,     # returns (validity, uniqueness)
+            archive=archive,
         )
-        best_params, best_fitness, history = optimizer.optimize()
+        best_params, best_obj, history = optimizer.optimize()
     """
 
     def __init__(
@@ -247,7 +369,8 @@ class QuantumOptimizer:
         n_params: int,
         n_particles: int = 20,
         max_iterations: int = 50,
-        fitness_fn: Optional[Callable[[np.ndarray], float]] = None,
+        fitness_fn: Optional[Callable[[np.ndarray], Tuple[float, float]]] = None,
+        archive: Optional[ParetoArchive] = None,
         alpha_max: float = 1.0,
         alpha_min: float = 0.5,
         param_lower: float = -np.pi,
@@ -255,7 +378,7 @@ class QuantumOptimizer:
         seed: Optional[int] = None,
         verbose: bool = True,
         iteration_callback: Optional[Callable[[int, dict], None]] = None,
-        # ── v3: 抗停滯超參數 ──
+        # ── 抗停滯超參數（繼承自 v3）──
         stagnation_limit: int = 5,
         reinit_fraction: float = 0.3,
         mutation_prob: float = 0.15,
@@ -264,22 +387,23 @@ class QuantumOptimizer:
         alpha_stag_boost: float = 0.3,
     ):
         """
-        初始化 QPSO 優化器。
+        初始化 MOQPSO 優化器。
 
         Args:
-            n_params:        參數空間維度 D（= 5N − 2）
-            n_particles:     粒子數量 M（建議 15~30）
-            max_iterations:  最大迭代次數 T
-            fitness_fn:      適應度函式 f(params) → float
-            alpha_max:       α 的最大值（初期，鼓勵探索）
-            alpha_min:       α 的最小值（末期，促進收斂）
-            param_lower:     參數下界
-            param_upper:     參數上界
-            seed:            隨機數種子
-            verbose:         是否印出每輪進度
+            n_params:          參數空間維度 D（= 5N − 2）
+            n_particles:       粒子數量 M（建議 15~30）
+            max_iterations:    最大迭代次數 T
+            fitness_fn:        目標函式 f(params) → (validity, uniqueness)
+            archive:           外部 Pareto Archive（若 None 則自動建立）
+            alpha_max:         α 的最大值（初期，鼓勵探索）
+            alpha_min:         α 的最小值（末期，促進收斂）
+            param_lower:       參數下界
+            param_upper:       參數上界
+            seed:              隨機數種子
+            verbose:           是否印出每輪進度
             iteration_callback: 每輪迭代結束後回呼
 
-            stagnation_limit:  連續幾代 gbest 未改善就觸發重初始化
+            stagnation_limit:  連續幾代 Archive 未變化就觸發重初始化
             reinit_fraction:   停滯時重初始化的粒子比例 (0~1)
             mutation_prob:     每個粒子在每輪被 Cauchy 變異的機率
             mutation_scale:    Cauchy 變異的尺度因子 (相對於 param range)
@@ -290,6 +414,7 @@ class QuantumOptimizer:
         self.M = n_particles
         self.T = max_iterations
         self.fitness_fn = fitness_fn
+        self.archive = archive if archive is not None else ParetoArchive()
         self.alpha_max = alpha_max
         self.alpha_min = alpha_min
         self.lb = param_lower
@@ -297,7 +422,7 @@ class QuantumOptimizer:
         self.verbose = verbose
         self.iteration_callback = iteration_callback
 
-        # v3 新參數
+        # 抗停滯參數
         self.stagnation_limit = stagnation_limit
         self.reinit_fraction = reinit_fraction
         self.mutation_prob = mutation_prob
@@ -313,12 +438,13 @@ class QuantumOptimizer:
             self.lb, self.ub, size=(self.M, self.D)
         )
         self.pbest = self.positions.copy()
-        self.pbest_fitness = np.full(self.M, -np.inf)
-        self.gbest = self.positions[0].copy()
-        self.gbest_fitness = -np.inf
+        # pbest_objectives[i] = (validity, uniqueness) or None
+        self.pbest_objectives: List[Optional[Tuple[float, float]]] = \
+            [None] * self.M
 
-        # v3: 停滯追蹤
+        # 停滯追蹤（基於 Archive 大小變化）
         self._stagnation_counter = 0
+        self._prev_archive_size = 0
         self._total_reinits = 0
         self._total_mutations = 0
 
@@ -326,25 +452,69 @@ class QuantumOptimizer:
         self.history: List[dict] = []
 
     # ────────────────────────────────────────────────────────────
-    # v3: Cosine Annealing α 排程
+    # Pareto 支配判斷
+    # ────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _dominates(a: Tuple[float, float], b: Tuple[float, float]) -> bool:
+        """
+        判斷目標向量 a 是否支配 b。
+
+        支配條件：
+          ∀i: a_i ≥ b_i  且  ∃j: a_j > b_j
+        """
+        all_ge = all(ai >= bi for ai, bi in zip(a, b))
+        any_gt = any(ai > bi for ai, bi in zip(a, b))
+        return all_ge and any_gt
+
+    # ────────────────────────────────────────────────────────────
+    # pbest 更新（Pareto 支配規則）
+    # ────────────────────────────────────────────────────────────
+
+    def _update_pbest(self, i: int, new_obj: Tuple[float, float]):
+        """
+        使用 Pareto 支配規則更新粒子 i 的個人最佳 (pbest)。
+
+        規則：
+          • 首次評估 → 直接設定
+          • 新解支配舊 pbest → 更新
+          • 舊 pbest 支配新解 → 保留
+          • 互不支配 → 50% 機率替換（維持多樣性）
+
+        Args:
+            i:       粒子索引
+            new_obj: 新位置的目標向量 (validity, uniqueness)
+        """
+        old_obj = self.pbest_objectives[i]
+
+        if old_obj is None:
+            # 首次評估
+            self.pbest[i] = self.positions[i].copy()
+            self.pbest_objectives[i] = new_obj
+            return
+
+        if self._dominates(new_obj, old_obj):
+            # 新解支配舊 pbest → 更新
+            self.pbest[i] = self.positions[i].copy()
+            self.pbest_objectives[i] = new_obj
+        elif self._dominates(old_obj, new_obj):
+            # 舊 pbest 支配新解 → 保留
+            pass
+        else:
+            # 互不支配 → 50% 機率替換
+            if self.rng.random() < 0.5:
+                self.pbest[i] = self.positions[i].copy()
+                self.pbest_objectives[i] = new_obj
+
+    # ────────────────────────────────────────────────────────────
+    # Cosine Annealing α 排程
     # ────────────────────────────────────────────────────────────
 
     def _get_alpha(self, t: int) -> float:
         """
-        計算第 t 輪的收縮-擴張係數 α（Cosine Annealing + 隨機擾動）。
+        計算第 t 輪的收縮-擴張係數 α（Cosine Annealing + 擾動 + 停滯提升）。
 
-        Cosine Annealing：
-            α_base(t) = α_min + ½(α_max − α_min)(1 + cos(πt / T))
-
-        相比線性遞減的優勢：
-        ┌──────────────────────────────────────────────────────┐
-        │ • 初期衰減慢 → 維持更久的高 α 探索期               │
-        │ • 中期衰減快 → 避免浪費算力在中間地帶               │
-        │ • 末期衰減緩 → 保留微幅探索能力，不完全鎖死         │
-        │ • 加上隨機擾動 → 打破確定性衰減軌跡                 │
-        └──────────────────────────────────────────────────────┘
-
-        Extra：若處於停滯狀態，額外加上 alpha_stag_boost 以擴大搜索。
+            α_base(t) = α_min + ½(α_max − α_min)(1 + cos(πt/T))
 
         Args:
             t: 目前迭代輪次 (0-indexed)
@@ -354,22 +524,18 @@ class QuantumOptimizer:
         """
         progress = t / max(self.T - 1, 1)
 
-        # Cosine annealing 基線
         alpha_base = self.alpha_min + 0.5 * (self.alpha_max - self.alpha_min) * (
             1.0 + math.cos(math.pi * progress)
         )
 
-        # 隨機擾動（高斯）
         perturbation = self.rng.normal(0, self.alpha_perturb_std)
 
-        # 停滯提升
         stag_boost = 0.0
         if self._stagnation_counter >= self.stagnation_limit:
             stag_boost = self.alpha_stag_boost
 
         alpha = alpha_base + perturbation + stag_boost
 
-        # 上下界保護
         alpha_upper = self.alpha_max + self.alpha_stag_boost
         return float(np.clip(alpha, self.alpha_min * 0.8, alpha_upper))
 
@@ -382,37 +548,40 @@ class QuantumOptimizer:
         計算 mbest（所有粒子個人最佳位置的平均值）。
 
             mbest_d = (1/M) × Σᵢ pbest_i,d
-
-        Returns:
-            mbest: shape (D,) 的平均最佳位置向量
         """
         return np.mean(self.pbest, axis=0)
 
     # ────────────────────────────────────────────────────────────
-    # QPSO 位置更新核心
+    # MOQPSO 位置更新核心
     # ────────────────────────────────────────────────────────────
 
     def _update_position(
         self, x: np.ndarray, pbest_i: np.ndarray,
-        gbest: np.ndarray, mbest: np.ndarray, alpha: float
+        guide: np.ndarray, mbest: np.ndarray, alpha: float
     ) -> np.ndarray:
         """
         使用 QPSO Delta 勢阱模型更新單一粒子的位置。
 
+        與 v3 的差異：gbest 被替換為 guide（從 Archive 選出）。
+
+            p = φ × pbest_i + (1 − φ) × guide
             x_new = p ± α × |mbest − x| × ln(1/u)
 
         Args:
-            x, pbest_i, gbest, mbest: 位置向量 (D,)
-            alpha: 收縮-擴張係數
+            x:       目前位置 (D,)
+            pbest_i: 粒子個人最佳位置 (D,)
+            guide:   從 Pareto Archive 選出的吸引子 (D,)
+            mbest:   全體 pbest 平均 (D,)
+            alpha:   收縮-擴張係數
 
         Returns:
             x_new: 更新後的位置 (D,)
         """
         D = self.D
 
-        # Step 1: 局部吸引子
+        # Step 1: 局部吸引子（Archive-guided）
         phi = self.rng.uniform(0, 1, size=D)
-        p = phi * pbest_i + (1.0 - phi) * gbest
+        p = phi * pbest_i + (1.0 - phi) * guide
 
         # Step 2: Delta 勢阱採樣
         u = np.maximum(self.rng.uniform(0, 1, size=D), 1e-10)
@@ -429,27 +598,21 @@ class QuantumOptimizer:
         return x_new
 
     # ────────────────────────────────────────────────────────────
-    # v3: Cauchy 變異 (Mutation)
+    # Cauchy 變異 (Mutation)
     # ────────────────────────────────────────────────────────────
 
     def _cauchy_mutation(self, x: np.ndarray) -> np.ndarray:
         """
-        對位置向量施加 Cauchy 分佈變異。
+        對位置向量施加 Cauchy 分佈變異（重尾探索）。
 
         為何用 Cauchy 而非 Gaussian？
-        ────────────────────────────
-        Cauchy 分佈具有「重尾」(Heavy tail) 特性，
-        產生的跳躍距離分佈更廣：
-          • Gaussian：99.7% 的跳躍在 ±3σ 以內
-          • Cauchy  ：經常產生 >3σ 甚至 >10σ 的大跳躍
-
-        這使粒子能偶爾「跳出」當前盆地，探索遠處的搜索空間。
-        在分子生成中，這對應於「嘗試完全不同的原子/鍵組合」。
+        ─ Cauchy 的重尾 (heavy tail) 讓粒子偶爾產生大幅跳躍，
+          跳出當前盆地，探索遠處的搜索空間。
 
         實作：
-          1. 隨機選取 D 維度的一個子集（proportion ~ 0.3~0.5）
-          2. 對選取的維度施加 Cauchy 擾動
-          3. 未選取的維度保持不變（局部結構保持）
+          1. 隨機選取 30%~50% 的維度
+          2. 對選取維度施加 Cauchy 擾動
+          3. 未選取維度保持不變
 
         Args:
             x: 原始位置向量 (D,)
@@ -459,11 +622,9 @@ class QuantumOptimizer:
         """
         x_mut = x.copy()
 
-        # 隨機選取 30%~50% 的維度進行變異
         n_mutate = max(1, int(self.D * self.rng.uniform(0.3, 0.5)))
         dims = self.rng.choice(self.D, size=n_mutate, replace=False)
 
-        # Cauchy 擾動 = standard_cauchy × scale
         cauchy_noise = self.rng.standard_cauchy(size=n_mutate) * self.mutation_scale
 
         x_mut[dims] += cauchy_noise
@@ -471,64 +632,44 @@ class QuantumOptimizer:
 
         return x_mut
 
-    def _mutate_gbest(self) -> np.ndarray:
-        """
-        對 gbest 施加小幅 Cauchy 變異，探索最優解的鄰近盆地。
-
-        與一般粒子變異不同：
-          • 只擾動 10%~20% 的維度（保守探索）
-          • 擾動幅度為一般變異的 50%
-
-        Returns:
-            gbest 的變異版本 (D,)
-        """
-        x_mut = self.gbest.copy()
-
-        n_mutate = max(1, int(self.D * self.rng.uniform(0.1, 0.2)))
-        dims = self.rng.choice(self.D, size=n_mutate, replace=False)
-
-        cauchy_noise = self.rng.standard_cauchy(size=n_mutate) * (self.mutation_scale * 0.5)
-        x_mut[dims] += cauchy_noise
-
-        return np.clip(x_mut, self.lb, self.ub)
-
     # ────────────────────────────────────────────────────────────
-    # v3: 停滯偵測 & 部分粒子重初始化
+    # 多樣性度量
     # ────────────────────────────────────────────────────────────
 
-    def _check_and_reinit(self, prev_gbest_fitness: float) -> bool:
+    def _compute_diversity(self) -> float:
         """
-        檢查是否處於停滯狀態，若是則對最差粒子重初始化。
+        計算粒子群的多樣性指標（位置標準差的平均值）。
 
-        停滯判定：
-          連續 stagnation_limit 輪 gbest_fitness 完全未改善
-          （改善定義：提升 > 1e-8）
+            diversity = (1/D) × Σ_d std(positions[:, d])
+        """
+        return float(np.mean(np.std(self.positions, axis=0)))
+
+    # ────────────────────────────────────────────────────────────
+    # 停滯偵測 & 部分粒子重初始化
+    # ────────────────────────────────────────────────────────────
+
+    def _check_and_reinit(self) -> bool:
+        """
+        基於 Archive 大小穩定度的停滯偵測。
+
+        在 MOQPSO 中，「停滯」定義為 Archive 連續 N 代
+        未新增任何非支配解（大小不增）。此時重初始化最差粒子。
 
         重初始化策略：
-        ┌──────────────────────────────────────────────────────┐
-        │ 1. 按 pbest_fitness 排序，找出最差的                 │
-        │    reinit_fraction × M 個粒子                        │
-        │ 2. 將這些粒子的位置替換為：                          │
-        │    • 前半數：完全隨機（全域探索）                     │
-        │    • 後半數：在 gbest 附近的高斯擾動（局部探索）      │
-        │ 3. 重置這些粒子的 pbest 與 pbest_fitness             │
-        │ 4. 重置停滯計數器                                    │
-        └──────────────────────────────────────────────────────┘
-
-        Args:
-            prev_gbest_fitness: 上一輪的 gbest_fitness
+          • 前半數：完全隨機（全域探索）
+          • 後半數：在 Archive Leader 附近的高斯擾動（局部探索）
 
         Returns:
             是否觸發了重初始化
         """
-        # 判斷是否有改善
-        improved = (self.gbest_fitness - prev_gbest_fitness) > 1e-8
+        current_size = len(self.archive)
 
-        if improved:
+        if current_size > self._prev_archive_size:
             self._stagnation_counter = 0
-            return False
+        else:
+            self._stagnation_counter += 1
 
-        self._stagnation_counter += 1
+        self._prev_archive_size = current_size
 
         if self._stagnation_counter < self.stagnation_limit:
             return False
@@ -536,8 +677,15 @@ class QuantumOptimizer:
         # ── 觸發重初始化 ──
         n_reinit = max(1, int(self.M * self.reinit_fraction))
 
-        # 找出 pbest_fitness 最差的粒子
-        worst_indices = np.argsort(self.pbest_fitness)[:n_reinit]
+        # 按 pbest 目標和排序，找出最差粒子
+        obj_sums = []
+        for i in range(self.M):
+            if self.pbest_objectives[i] is not None:
+                obj_sums.append(sum(self.pbest_objectives[i]))
+            else:
+                obj_sums.append(-np.inf)
+
+        worst_indices = np.argsort(obj_sums)[:n_reinit]
 
         for k, idx in enumerate(worst_indices):
             if k < n_reinit // 2:
@@ -546,176 +694,183 @@ class QuantumOptimizer:
                     self.lb, self.ub, size=self.D
                 )
             else:
-                # 策略 B：gbest 附近的高斯擾動（局部探索）
-                noise_std = (self.ub - self.lb) * 0.25
-                noise = self.rng.normal(0, noise_std, size=self.D)
-                self.positions[idx] = np.clip(
-                    self.gbest + noise, self.lb, self.ub
-                )
+                # 策略 B：Archive Leader 附近的高斯擾動
+                ref = self.archive.select_leader(self.rng)
+                if ref is not None:
+                    noise = self.rng.normal(
+                        0, (self.ub - self.lb) * 0.25, size=self.D
+                    )
+                    self.positions[idx] = np.clip(
+                        ref + noise, self.lb, self.ub
+                    )
+                else:
+                    self.positions[idx] = self.rng.uniform(
+                        self.lb, self.ub, size=self.D
+                    )
 
             # 重置該粒子的 pbest
             self.pbest[idx] = self.positions[idx].copy()
-            self.pbest_fitness[idx] = -np.inf
+            self.pbest_objectives[idx] = None
 
         self._stagnation_counter = 0
         self._total_reinits += 1
 
         if self.verbose:
             print(
-                f"  ⚡ [停滯偵測] 連續 {self.stagnation_limit} 代無進步，"
-                f"已重初始化 {n_reinit} 個粒子（共 {self._total_reinits} 次）"
+                f"  ⚡ [停滯偵測] 連續 {self.stagnation_limit} 代 "
+                f"Archive 無新增非支配解，"
+                f"已重初始化 {n_reinit} 個粒子"
+                f"（共 {self._total_reinits} 次）"
             )
 
         return True
 
     # ────────────────────────────────────────────────────────────
-    # v3: 多樣性度量
-    # ────────────────────────────────────────────────────────────
-
-    def _compute_diversity(self) -> float:
-        """
-        計算粒子群的多樣性指標。
-
-        定義：所有粒子位置在各維度上的平均標準差。
-
-            diversity = (1/D) × Σ_d std(positions[:, d])
-
-        diversity 高 → 粒子分散 → 探索狀態
-        diversity 低 → 粒子聚集 → 可能已收斂或停滯
-
-        Returns:
-            diversity ∈ [0, +∞)
-        """
-        return float(np.mean(np.std(self.positions, axis=0)))
-
-    # ────────────────────────────────────────────────────────────
     # 主要優化迴圈
     # ────────────────────────────────────────────────────────────
 
-    def optimize(self) -> Tuple[np.ndarray, float, List[dict]]:
+    def optimize(self) -> Tuple[np.ndarray, Tuple[float, float], List[dict]]:
         """
-        執行 QPSO 優化迭代（v3：含 Cauchy 變異 + 停滯偵測）。
+        執行 MOQPSO 多目標優化迭代。
 
         完整流程（每輪迭代）：
         ─────────────────────
         1. 計算 α（Cosine Annealing + 擾動 + 停滯提升）
         2. 計算 mbest
         3. 對每個粒子：
-           a. QPSO Delta 勢阱位置更新
-           b. 以機率 p_mut 施加 Cauchy 變異
-           c. 評估適應度
-           d. 更新 pbest / gbest
-        4. 對 gbest 施加 Cauchy 探索（評估但不取代除非更好）
-        5. 停滯偵測：若連續 N 代無改善 → 重初始化最差粒子
-        6. 記錄歷史 + 回呼 + 進度輸出
+           a. 從 Archive 選擇 guide（擁擠距離輪盤）
+           b. QPSO Delta 勢阱位置更新（guide 取代固定 gbest）
+           c. 以機率 p_mut 施加 Cauchy 變異
+           d. 評估目標 (validity, uniqueness)
+           e. 更新 pbest（Pareto 支配規則）
+           f. 嘗試加入 Archive
+        4. 停滯偵測：若 Archive 連續 N 代未變化 → 重初始化
+        5. 記錄歷史 + 回呼 + 進度輸出
 
         Returns:
-            (gbest, gbest_fitness, history)
+            (best_params, best_obj, history)
+            best_params: 折中最優解的參數向量
+            best_obj:    折中最優解的目標 (validity, uniqueness)
+            history:     每輪迭代的紀錄列表
         """
         if self.fitness_fn is None:
-            raise ValueError("fitness_fn 未設定！請在初始化時提供適應度函式。")
+            raise ValueError("fitness_fn 未設定！請在初始化時提供目標函式。")
 
         print("=" * 70)
-        print("QPSO 量子粒子群優化 v3（抗停滯版）啟動")
+        print("MOQPSO 多目標量子粒子群優化 v5 啟動")
         print(f"  粒子數 (M)       : {self.M}")
         print(f"  參數維度 (D)     : {self.D}")
         print(f"  最大迭代 (T)     : {self.T}")
         print(f"  α 範圍           : {self.alpha_max} → {self.alpha_min} (cosine)")
         print(f"  參數範圍         : [{self.lb:.4f}, {self.ub:.4f}]")
+        print(f"  目標             : Validity × Uniqueness（雙目標最大化）")
+        print(f"  吸引子選擇       : Pareto Archive 擁擠距離輪盤")
+        print(f"  pbest 更新       : Pareto 支配規則 + 50% 隨機替換")
         print(f"  停滯門檻         : {self.stagnation_limit} 代")
         print(f"  重初始化比例     : {self.reinit_fraction:.0%}")
         print(f"  Cauchy 變異機率  : {self.mutation_prob:.0%}")
         print("=" * 70)
 
         # ── 初始適應度評估 ──
-        print("\n[初始化] 評估所有粒子的初始適應度...")
+        print("\n[初始化] 評估所有粒子的初始目標值...")
         for i in range(self.M):
-            fitness = self.fitness_fn(self.positions[i])
-            self.pbest_fitness[i] = fitness
+            obj = self.fitness_fn(self.positions[i])
+            self.pbest_objectives[i] = obj
             self.pbest[i] = self.positions[i].copy()
+            self.archive.try_add(
+                params=self.positions[i],
+                objectives={
+                    'validity': obj[0],
+                    'uniqueness': obj[1],
+                },
+            )
 
-            if fitness > self.gbest_fitness:
-                self.gbest_fitness = fitness
-                self.gbest = self.positions[i].copy()
-
-        print(f"[初始化] 完成。初始全域最佳適應度: {self.gbest_fitness:.6f}\n")
+        compromise = self.archive.best_compromise()
+        init_obj = compromise['obj_vec'] if compromise else (0, 0)
+        self._prev_archive_size = len(self.archive)
+        print(
+            f"[初始化] 完成。Archive 大小: {len(self.archive)}  "
+            f"最優折中: val={init_obj[0]:.4f}, uniq={init_obj[1]:.4f}\n"
+        )
 
         # ── 主迭代迴圈 ──
         for t in range(self.T):
-            prev_gbest_fitness = self.gbest_fitness
-
-            # 計算當前 α（Cosine Annealing + 擾動 + 停滯提升）
+            # 計算當前 α
             alpha = self._get_alpha(t)
 
-            # 計算 mbest（平均最佳位置）
+            # 計算 mbest
             mbest = self._compute_mbest()
 
-            iteration_fitnesses: List[float] = []
+            iter_validities: List[float] = []
+            iter_uniquenesses: List[float] = []
             n_mutated_this_iter = 0
 
             # ── 更新每個粒子 ──
             for i in range(self.M):
-                # Step 1: QPSO 位置更新
+                # Step 1: 從 Archive 選擇 guide
+                guide = self.archive.select_leader(self.rng)
+                if guide is None:
+                    # Archive 為空時 fallback 到 pbest
+                    guide = self.pbest[i]
+
+                # Step 2: QPSO 位置更新
                 self.positions[i] = self._update_position(
                     x=self.positions[i],
                     pbest_i=self.pbest[i],
-                    gbest=self.gbest,
+                    guide=guide,
                     mbest=mbest,
                     alpha=alpha,
                 )
 
-                # Step 2 (v3): Cauchy 變異
+                # Step 3: Cauchy 變異
                 if self.rng.random() < self.mutation_prob:
                     self.positions[i] = self._cauchy_mutation(self.positions[i])
                     n_mutated_this_iter += 1
 
-                # Step 3: 評估新位置的適應度
-                fitness = self.fitness_fn(self.positions[i])
-                iteration_fitnesses.append(fitness)
+                # Step 4: 評估新位置的目標
+                obj = self.fitness_fn(self.positions[i])
+                iter_validities.append(obj[0])
+                iter_uniquenesses.append(obj[1])
 
-                # Step 4: 更新個人最佳 (pbest)
-                if fitness > self.pbest_fitness[i]:
-                    self.pbest_fitness[i] = fitness
-                    self.pbest[i] = self.positions[i].copy()
+                # Step 5: 更新 pbest（Pareto 支配規則）
+                self._update_pbest(i, obj)
 
-                # Step 5: 更新全域最佳 (gbest)
-                if fitness > self.gbest_fitness:
-                    self.gbest_fitness = fitness
-                    self.gbest = self.positions[i].copy()
-
-            # ── v3: 對 gbest 進行鄰域探索 ──
-            gbest_candidate = self._mutate_gbest()
-            gbest_cand_fitness = self.fitness_fn(gbest_candidate)
-            iteration_fitnesses.append(gbest_cand_fitness)
-
-            if gbest_cand_fitness > self.gbest_fitness:
-                self.gbest_fitness = gbest_cand_fitness
-                self.gbest = gbest_candidate.copy()
-                if self.verbose:
-                    print(
-                        f"  🔬 [Gbest 變異] 在鄰域發現更優解！"
-                        f" fitness: {gbest_cand_fitness:.6f}"
-                    )
+                # Step 6: 嘗試加入 Archive
+                self.archive.try_add(
+                    params=self.positions[i],
+                    objectives={
+                        'validity': obj[0],
+                        'uniqueness': obj[1],
+                    },
+                )
 
             self._total_mutations += n_mutated_this_iter
 
-            # ── v3: 停滯偵測 & 重初始化 ──
-            self._check_and_reinit(prev_gbest_fitness)
+            # ── 停滯偵測 & 重初始化 ──
+            self._check_and_reinit()
 
             # ── 多樣性度量 ──
             diversity = self._compute_diversity()
+
+            # ── 本輪最優 ──
+            compromise = self.archive.best_compromise()
+            best_obj = compromise['obj_vec'] if compromise else (0, 0)
+            best_params_this = (
+                compromise['params'].copy() if compromise else None
+            )
 
             # ── 記錄歷史 ──
             iter_record = {
                 'iteration': t,
                 'alpha': alpha,
-                'gbest_fitness': self.gbest_fitness,
-                'gbest_params': self.gbest.copy(),
-                'mean_fitness': float(np.mean(iteration_fitnesses)),
-                'max_fitness': float(np.max(iteration_fitnesses)),
-                'min_fitness': float(np.min(iteration_fitnesses)),
-                'std_fitness': float(np.std(iteration_fitnesses)),
-                # v3 附加指標
+                'archive_size': len(self.archive),
+                'best_validity': best_obj[0],
+                'best_uniqueness': best_obj[1],
+                'best_compromise_params': best_params_this,
+                'mean_validity': float(np.mean(iter_validities)),
+                'mean_uniqueness': float(np.mean(iter_uniquenesses)),
+                'max_validity': float(np.max(iter_validities)),
+                'max_uniqueness': float(np.max(iter_uniquenesses)),
                 'diversity': diversity,
                 'stagnation_counter': self._stagnation_counter,
                 'n_mutated': n_mutated_this_iter,
@@ -739,53 +894,61 @@ class QuantumOptimizer:
                 print(
                     f"[Iter {t + 1:3d}/{self.T}]  "
                     f"α={alpha:.4f}  "
-                    f"gbest={self.gbest_fitness:.6f}  "
-                    f"mean={iter_record['mean_fitness']:.6f}  "
+                    f"arch={len(self.archive):3d}  "
+                    f"best_val={best_obj[0]:.4f}  "
+                    f"best_uniq={best_obj[1]:.4f}  "
                     f"div={diversity:.4f}  "
                     f"mut={n_mutated_this_iter}"
                     f"{stag_marker}"
                 )
 
         # ── 最終報告 ──
+        compromise = self.archive.best_compromise()
+        best_params = compromise['params'] if compromise else self.pbest[0]
+        best_obj = compromise['obj_vec'] if compromise else (0, 0)
+
         print("\n" + "=" * 70)
-        print("QPSO v3 優化完成")
-        print(f"  最佳適應度       : {self.gbest_fitness:.6f}")
-        print(f"  最佳參數 (前6維) : {self.gbest[:6].round(4)}")
+        print("MOQPSO v5 優化完成")
+        print(f"  Archive 大小     : {len(self.archive)}")
+        print(f"  最優折中解       : validity={best_obj[0]:.4f}, "
+              f"uniqueness={best_obj[1]:.4f}")
         print(f"  總重初始化次數   : {self._total_reinits}")
         print(f"  總變異粒子次數   : {self._total_mutations}")
         print(f"  最終多樣性       : {self._compute_diversity():.4f}")
         print("=" * 70)
 
-        return self.gbest.copy(), self.gbest_fitness, self.history
+        return best_params.copy(), best_obj, self.history
 
     # ────────────────────────────────────────────────────────────
     # 工具函式
     # ────────────────────────────────────────────────────────────
 
-    def get_convergence_curve(self) -> Tuple[List[int], List[float]]:
+    def get_convergence_curve(
+        self,
+    ) -> Tuple[List[int], List[float], List[float]]:
         """
         取得收斂曲線資料（用於繪圖）。
 
         Returns:
-            (iterations, gbest_fitnesses)
+            (iterations, best_validities, best_uniquenesses)
         """
         iterations = [h['iteration'] for h in self.history]
-        fitnesses = [h['gbest_fitness'] for h in self.history]
-        return iterations, fitnesses
+        best_vals = [h['best_validity'] for h in self.history]
+        best_uniqs = [h['best_uniqueness'] for h in self.history]
+        return iterations, best_vals, best_uniqs
 
     def reset(self):
         """
         重置優化器狀態，使用新的隨機粒子位置。
-        保留相同的超參數設定。
+        保留相同的超參數設定。Archive 不重置。
         """
         self.positions = self.rng.uniform(
             self.lb, self.ub, size=(self.M, self.D)
         )
         self.pbest = self.positions.copy()
-        self.pbest_fitness = np.full(self.M, -np.inf)
-        self.gbest = self.positions[0].copy()
-        self.gbest_fitness = -np.inf
+        self.pbest_objectives = [None] * self.M
         self._stagnation_counter = 0
+        self._prev_archive_size = len(self.archive)
         self._total_reinits = 0
         self._total_mutations = 0
         self.history = []

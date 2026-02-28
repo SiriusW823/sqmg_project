@@ -51,22 +51,6 @@ from typing import Dict, List, Optional, Tuple
 from rdkit import Chem
 from rdkit.Chem import Descriptors, QED, rdmolops
 
-# ── SA Score (Synthetic Accessibility) — Ertl-Schuffenhauer scorer ──
-# 嘗試從 RDKit contrib 載入；若不可用則使用描述符代理函式
-_sa_scorer_available = False
-try:
-    import os as _os
-    from rdkit.Chem import RDConfig as _RDConfig
-    import sys as _sys
-    _sa_score_path = _os.path.join(_RDConfig.RDContribDir, 'SA_Score')
-    if _os.path.isdir(_sa_score_path):
-        if _sa_score_path not in _sys.path:
-            _sys.path.insert(0, _sa_score_path)
-        import sascorer as _sascorer
-        _sa_scorer_available = True
-except Exception:
-    pass
-
 
 # ============================================================================
 # 映射表 (Lookup Tables)
@@ -583,172 +567,28 @@ class MoleculeDecoder:
         return results
 
     # ────────────────────────────────────────────────────────────
-    # v4: SA Score / Valency Penalty / Size Reward 輔助函式
-    # ────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def compute_sa_score(mol: Chem.Mol) -> float:
-        """
-        計算正規化 Synthetic Accessibility 分數 [0, 1]（越高越容易合成）。
-
-        優先使用 RDKit contrib 的 Ertl-Schuffenhauer SA scorer，
-        若不可用則以描述符代理函式估計。
-
-        Args:
-            mol: 經 sanitize 的 RDKit Mol 物件
-
-        Returns:
-            SA score ∈ [0, 1]（0 = 極難合成, 1 = 容易合成）
-        """
-        if mol is None:
-            return 0.0
-        try:
-            if _sa_scorer_available:
-                raw = _sascorer.calculateScore(mol)   # 1 (easy) → 10 (hard)
-                return max(0.0, (10.0 - raw) / 9.0)
-        except Exception:
-            pass
-        # ── Fallback: 描述符代理 ──
-        try:
-            n_atoms = mol.GetNumHeavyAtoms()
-            if n_atoms == 0:
-                return 0.0
-            n_carbon = sum(1 for a in mol.GetAtoms() if a.GetAtomicNum() == 6)
-            carbon_ratio = n_carbon / n_atoms
-            # 碳骨架比例高 → 合成容易性高（藥物分子通常以 C 為主）
-            ring_info = mol.GetRingInfo()
-            n_rings = ring_info.NumRings()
-            ring_penalty = min(n_rings * 0.08, 0.25)
-            sa_proxy = min(carbon_ratio * 1.3, 1.0) - ring_penalty
-            return max(0.0, min(1.0, sa_proxy))
-        except Exception:
-            return 0.5
-
-    @staticmethod
-    def _compute_valency_penalty(mol: Chem.Mol) -> float:
-        """
-        檢查化學合理性，對「技術上通過 SanitizeMol 但實際不合理」的
-        結構施加懲罰。
-
-        懲罰規則（每條違規累加）：
-        ┌───────────────────────────────────────────────────────────┐
-        │ 規則                         │ 懲罰值 │ 範例              │
-        ├──────────────────────────────┼────────┼───────────────────┤
-        │ 鹵素 (F/Cl) 出現非單鍵       │ +0.50  │ F=C, Cl#S         │
-        │ O 或 S 出現三鍵              │ +0.30  │ S#S, O#C          │
-        │ 無碳骨架 (≥2 原子全為雜原子)  │ +0.30  │ [SH]#SCl, NOS     │
-        │ 分子僅 1 個重原子 (碎片)      │ +0.20  │ [OH], [NH2]       │
-        └───────────────────────────────┴────────┴───────────────────┘
-
-        Args:
-            mol: RDKit Mol 物件（已通過 SanitizeMol）
-
-        Returns:
-            penalty ∈ [0.0, 2.0]（已上限截斷）
-        """
-        if mol is None:
-            return 2.0
-
-        penalty = 0.0
-        n_atoms = mol.GetNumHeavyAtoms()
-        if n_atoms == 0:
-            return 2.0
-
-        HALOGEN_NUMS = {9, 17}     # F, Cl
-        n_carbon = 0
-
-        for atom in mol.GetAtoms():
-            anum = atom.GetAtomicNum()
-            if anum == 6:
-                n_carbon += 1
-
-            # Rule 1: 鹵素只允許單鍵
-            if anum in HALOGEN_NUMS:
-                for bond in atom.GetBonds():
-                    if bond.GetBondTypeAsDouble() > 1.0:
-                        penalty += 0.50
-
-            # Rule 2: O/S 出現三鍵（極不穩定）
-            if anum in (8, 16):
-                for bond in atom.GetBonds():
-                    if bond.GetBondTypeAsDouble() >= 3.0:
-                        penalty += 0.30
-
-        # Rule 3: 無碳骨架 → 大多化學不合理
-        if n_atoms >= 2 and n_carbon == 0:
-            penalty += 0.30
-
-        # Rule 4: 單原子碎片
-        if n_atoms == 1:
-            penalty += 0.20
-
-        return min(penalty, 2.0)
-
-    def _compute_size_reward(self, n_heavy: int) -> float:
-        """
-        Heavy Atom 數量獎勵 — 鼓勵生成較大分子而非小碎片。
-
-        階梯式獎勵曲線（以 max_atoms 為滿分參考）：
-          ratio ≥ 0.75 → reward ∈ [0.85, 1.00]  （★ 優秀）
-          ratio ≥ 0.50 → reward ∈ [0.50, 0.85]  （良好）
-          ratio ≥ 0.25 → reward ∈ [0.15, 0.50]  （尚可）
-          ratio <  0.25 → reward < 0.15          （處罰小碎片）
-
-        當 max_atoms=4 時：
-          4 atoms → 1.00   3 atoms → 0.85
-          2 atoms → 0.50   1 atom  → 0.15
-
-        Args:
-            n_heavy: 重原子數量
-
-        Returns:
-            size_reward ∈ [0.0, 1.0]
-        """
-        if self.max_atoms <= 0 or n_heavy <= 0:
-            return 0.0
-        ratio = min(n_heavy / self.max_atoms, 1.0)
-        if ratio >= 0.75:
-            return 0.85 + 0.15 * min((ratio - 0.75) / 0.25, 1.0)
-        elif ratio >= 0.50:
-            return 0.50 + 0.35 * (ratio - 0.50) / 0.25
-        elif ratio >= 0.25:
-            return 0.15 + 0.35 * (ratio - 0.25) / 0.25
-        else:
-            return max(0.05, ratio * 0.60)
-
-    # ────────────────────────────────────────────────────────────
-    # v4: Multi-Objective Shaping Reward
+    # v5: Shaping Reward（結構引導信號，不含 QED/SA）
     # ────────────────────────────────────────────────────────────
 
     def _score_molecule(self, record: Dict) -> float:
         """
-        為單一 bit-string 解碼結果計算「多目標漸進式獎勵」分數 (v4)。
+        為單一 bit-string 解碼結果計算結構 Shaping Reward (v5)。
 
-        ■ 完全有效分子 (valid=True) 的適應度公式：
-          Fitness = w_qed × QED
-                  + w_sa  × SA_norm
-                  + w_size × Size_Reward
-                  + w_conn × Connectivity
-                  − Penalty
+        v5 重點變更：完全移除 QED / SA / Penalty，
+        僅保留「結構完整度」引導信號，供漸進式獎勵使用。
 
-        各分量與權重：
-        ┌────────────────────────────────────────────────────────────┐
-        │ 分量              │ 權重  │ 意義                         │
-        ├───────────────────┼───────┼──────────────────────────────┤
-        │ QED               │ 0.35  │ 藥物相似性 (Drug-likeness)   │
-        │ SA_norm           │ 0.15  │ 合成可及性 (Synthesizability)│
-        │ Size_Reward       │ 0.30  │ 重原子數量獎勵               │
-        │ Connectivity      │ 0.10  │ 鍵結比率                     │
-        │ − Penalty         │ 0~2.0 │ 化學不合理性扣分             │
-        └───────────────────┴───────┴──────────────────────────────┘
-
-        ■ 部分有效 / 完全無效的結構保留漸進式獎勵（消除稀疏獎勵）。
+        ■ 有效分子 (valid=True)：
+            0.40 × size_ratio + 0.30 × connectivity + 0.30
+        ■ 部分有效 (partial_valid=True)：
+            0.30 × size_ratio + 0.20 × connectivity + 0.20 × coverage
+        ■ 完全無效：
+            0.20 × size_ratio + 0.10 × connectivity
 
         Args:
             record: decode_counts() 產出的單一結果 dict
 
         Returns:
-            shaped_score (float)，有效分子通常 ∈ [0.0, 0.90]
+            shaped_score ∈ [0.0, 1.0]
         """
         n_decoded = record.get('n_decoded_atoms', 0)
         n_bonds = record.get('n_bonds_formed', 0)
@@ -756,121 +596,75 @@ class MoleculeDecoder:
         if n_decoded == 0:
             return 0.0
 
-        # ── 基礎結構指標（所有分子都可計算）──
         max_bonds = max(n_decoded - 1, 1)
         connectivity = min(n_bonds / max_bonds, 1.0)
+        size_ratio = n_decoded / self.max_atoms
 
-        # ══════════════════════════════════════════════════════
-        # Case 1: 完全有效分子 — 使用多目標適應度公式
-        # ══════════════════════════════════════════════════════
         if record.get('valid'):
-            mol = record.get('mol')
-            qed = record.get('qed', 0.0)
+            return 0.40 * size_ratio + 0.30 * connectivity + 0.30
 
-            # SA Score (合成可及性)
-            sa_norm = self.compute_sa_score(mol)
-
-            # Size Reward (重原子數量獎勵)
-            n_heavy = mol.GetNumHeavyAtoms() if mol else n_decoded
-            size_reward = self._compute_size_reward(n_heavy)
-
-            # Valency Penalty (化學合理性懲罰)
-            penalty = self._compute_valency_penalty(mol)
-
-            # 多目標加權組合
-            score = (
-                0.35 * qed
-                + 0.15 * sa_norm
-                + 0.30 * size_reward
-                + 0.10 * connectivity
-                - penalty
-            )
-            return max(score, 0.0)
-
-        # ══════════════════════════════════════════════════════
-        # Case 2: 部分有效 — 漸進式中間獎勵
-        # ══════════════════════════════════════════════════════
         if record.get('partial_valid'):
             coverage = record.get('frag_coverage', 0.0)
-            validity_mid = 0.3 + 0.3 * coverage       # ∈ [0.3, 0.6]
-            partial_qed = record.get('partial_qed', 0.0) * coverage
-            size_ratio = n_decoded / self.max_atoms
-            return (
-                0.20 * size_ratio
-                + 0.10 * connectivity
-                + 0.25 * validity_mid
-                + 0.45 * partial_qed
-            )
+            return 0.30 * size_ratio + 0.20 * connectivity + 0.20 * coverage
 
-        # ══════════════════════════════════════════════════════
-        # Case 3: 完全無效 — 僅結構基底分
-        # ══════════════════════════════════════════════════════
-        size_ratio = n_decoded / self.max_atoms
         return 0.20 * size_ratio + 0.10 * connectivity
 
     # ────────────────────────────────────────────────────────────
     # 適應度計算 (Shaping Reward Fitness)
     # ────────────────────────────────────────────────────────────
 
-    def compute_fitness(self, counts: Dict[str, int],
-                        alpha: float = 0.4) -> Tuple[float, List[Dict]]:
+    def compute_fitness(
+        self, counts: Dict[str, int],
+    ) -> Tuple[Tuple[float, float], List[Dict]]:
         """
-        計算一組量子線路參數的 Shaping Reward 適應度分數。
+        計算一組量子線路參數的雙目標適應度 (v5 — MOQPSO)。
 
-        v3 漸進式獎勵：
-          fitness = α × mean_shaped + (1 − α) × mean_weighted_qed
+        回傳值為 (validity, uniqueness) 元組，供 MOQPSO 直接使用。
 
-        核心改進（相對於 v2 的 α×validity + (1−α)×mean_qed）：
+        目標定義：
         ──────────────────────────────────────────────────────────
-        1. mean_shaped：每個 bit-string 根據其 size / connectivity /
-           validity / QED 獲得 [0, 1] 的「漸進式」分數，
-           即使 Sanitize 失敗也有基底獎勵 → 消除稀疏獎勵問題。
-        2. mean_weighted_qed：不僅計算完全有效分子的 QED，
-           也將部分有效（salvaged fragment）的 QED 按覆蓋率
-           納入計算 → 為大分子提供平滑的 QED 訊號。
-
-        α 的語義：
-          α 高 → 結構探索（shaping 主導，鼓勵大分子）
-          α 低 → 品質利用（QED 主導，收斂到高品質分子）
+        • Validity   = n_valid / n_total
+          （通過 RDKit SanitizeMol 的比例）
+        • Uniqueness = n_unique_smiles / n_valid
+          （有效分子中不重複 SMILES 的比例；n_valid=0 時回傳 0）
 
         Args:
-            counts: bit-string 計數字典
-            alpha:  shaping vs QED 的權重 (0~1)
+            counts: bit-string 計數字典（來自 cudaq.sample()）
 
         Returns:
-            (fitness, decoded_results)
-            fitness:         適應度分數 (float)，恆 ≥ 0
+            ((validity, uniqueness), decoded_results)
+            validity:        ∈ [0, 1]
+            uniqueness:      ∈ [0, 1]
             decoded_results: 完整解碼結果列表
         """
         try:
             decoded = self.decode_counts(counts)
         except Exception:
-            return 0.0, []
+            return (0.0, 0.0), []
 
         if not decoded:
-            return 0.0, decoded
+            return (0.0, 0.0), decoded
 
-        # ── Per-molecule shaping scores ──
-        shaped_scores = [self._score_molecule(r) for r in decoded]
-        mean_shaped = float(np.mean(shaped_scores))
+        n_total = len(decoded)
 
-        # ── Weighted QED（含部分有效分子的部分 QED）──
-        qed_values: List[float] = []
-        for r in decoded:
-            if r.get('valid'):
-                qed_values.append(r['qed'])
-            elif r.get('partial_valid'):
-                qed_values.append(
-                    r['partial_qed'] * r['frag_coverage']
-                )
-            else:
-                qed_values.append(0.0)
-        mean_weighted_qed = float(np.mean(qed_values))
+        # ── 篩選完全有效分子（排除 partial_valid）──
+        valid = [
+            r for r in decoded
+            if r.get('valid') and not r.get('partial_valid')
+        ]
+        n_valid = len(valid)
 
-        # ── 組合適應度 ──
-        fitness = alpha * mean_shaped + (1.0 - alpha) * mean_weighted_qed
+        validity = n_valid / n_total if n_total > 0 else 0.0
 
-        return fitness, decoded
+        if n_valid > 0:
+            unique_smiles = {
+                r['smiles'] for r in valid if r.get('smiles')
+            }
+            uniqueness = len(unique_smiles) / n_valid
+        else:
+            uniqueness = 0.0
+
+        return (validity, uniqueness), decoded
 
     def summarize(self, decoded_results: List[Dict]) -> str:
         """

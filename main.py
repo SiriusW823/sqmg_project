@@ -73,7 +73,7 @@ except ImportError:
 # ── 本地模組 Import ──
 from sqmg_kernel import SQMGKernel
 from molecule_decoder import MoleculeDecoder
-from quantum_optimizer import QuantumOptimizer, ParetoArchive
+from quantum_optimizer import MOQPSOOptimizer, ParetoArchive
 from evaluator import MoleculeEvaluator
 from plot_utils import plot_all
 
@@ -116,93 +116,60 @@ def configure_cudaq_backend(target: str = "qpp-cpu"):
 def create_fitness_function(
     kernel: SQMGKernel,
     decoder: MoleculeDecoder,
-    alpha: float = 0.4,
     verbose_eval: bool = False,
-    pareto_archive: 'ParetoArchive | None' = None,
 ):
     """
-    建立連接 CUDA-Q kernel ↔ MoleculeDecoder ↔ QPSO 的適應度函式。
+    建立連接 CUDA-Q kernel ↔ MoleculeDecoder ↔ MOQPSO 的雙目標函式。
 
-    閉包 (Closure) 內封裝了 kernel 與 decoder 的參考，
-    使 QPSO 只需要傳入參數向量即可得到適應度分數。
-
-    v4 新增：
-      • Fitness = w1×QED + w2×SA + w3×Size_Reward + w4×Connectivity − Penalty
-        （實際由 decoder._score_molecule 內部計算）
-      • 若提供 pareto_archive，每次評估自動更新非支配解存檔
+    v5 重大變更：
+      • 回傳值從單一標量 fitness 顯變為 (validity, uniqueness) 元組
+      • 完全移除 QED / SA / Penalty，只追蹤兩個目標
+      • MOQPSO 直接使用此元組進行 Pareto 支配判定
 
     Args:
-        kernel:         SQMGKernel 實例
-        decoder:        MoleculeDecoder 實例
-        alpha:          shaping vs QED 的權重（0~1）
-        verbose_eval:   若 True，每次評估都印出詳細結果
-        pareto_archive: Pareto 非支配解存檔（可選）
+        kernel:       SQMGKernel 實例
+        decoder:      MoleculeDecoder 實例
+        verbose_eval: 若 True，每次評估都印出詳細結果
 
     Returns:
-        fitness_fn: Callable[[np.ndarray], float]
+        fitness_fn: Callable[[np.ndarray], Tuple[float, float]]
     """
     eval_count = [0]
 
-    def fitness_fn(params: np.ndarray) -> float:
+    def fitness_fn(params: np.ndarray):
         """
-        實際的適應度評估函式。
+        雙目標適應度評估函式。
 
         流程：
         1. params → CUDA-Q kernel (cudaq.sample)
         2. bit-strings → MoleculeDecoder
-        3. 分子 → RDKit → Validity + QED + SA + Size + Penalty
-        4. → fitness score
-        5. (可選) 更新 Pareto Archive
+        3. 分子 → RDKit → (validity, uniqueness)
         """
         eval_count[0] += 1
 
         try:
-            # ── Step 1: 量子取樣 ──
             counts = kernel.sample(params)
-
-            # ── Step 2: 解碼 & 計算適應度 ──
-            fitness, decoded = decoder.compute_fitness(counts, alpha=alpha)
+            (validity, uniqueness), decoded = decoder.compute_fitness(counts)
 
             if verbose_eval:
-                valid_count = sum(1 for r in decoded if r['valid'])
+                valid_count = sum(
+                    1 for r in decoded
+                    if r.get('valid') and not r.get('partial_valid')
+                )
                 print(
                     f"    [Eval #{eval_count[0]}] "
-                    f"Unique BS={len(decoded)} "
+                    f"BS={len(decoded)} "
                     f"Valid={valid_count} "
-                    f"Fitness={fitness:.6f}"
+                    f"val={validity:.4f} "
+                    f"uniq={uniqueness:.4f}"
                 )
 
-            # ── Step 3 (v4): 更新 Pareto Archive ──
-            if pareto_archive is not None and decoded:
-                valid = [
-                    r for r in decoded
-                    if r.get('valid') and not r.get('partial_valid')
-                ]
-                n_total = len(decoded)
-                if valid:
-                    qeds = [r['qed'] for r in valid]
-                    validity = len(valid) / n_total
-                    unique_smi = list({r['smiles'] for r in valid
-                                       if r.get('smiles')})
-                    uniqueness = (
-                        len(unique_smi) / len(valid) if len(valid) > 0 else 0
-                    )
-                    pareto_archive.try_add(
-                        params=params,
-                        objectives={
-                            'mean_qed': float(np.mean(qeds)),
-                            'val_x_uniq': validity * uniqueness,
-                        },
-                        fitness=fitness,
-                        smiles=unique_smi,
-                    )
-
-            return fitness
+            return (validity, uniqueness)
 
         except Exception as e:
             if verbose_eval:
                 print(f"    [Eval #{eval_count[0]}] 錯誤: {e}")
-            return 0.0
+            return (0.0, 0.0)
 
     return fitness_fn
 
@@ -357,24 +324,25 @@ def export_molecules_csv(molecules: List[Dict], filepath: str):
 
 
 def export_archive_csv(archive: ParetoArchive, filepath: str):
-    """匯出 Pareto Archive 非支配解至 CSV 檔案。"""
+    """匯出 Pareto Archive 非支配解至 CSV 檔案（v5 MOQPSO 版本）。"""
     front = archive.get_pareto_front()
     if not front:
         return
-    fieldnames = ['Rank', 'Fitness', 'Mean_QED', 'Val_x_Uniq',
+    fieldnames = ['Rank', 'Validity', 'Uniqueness',
                   'N_Molecules', 'Top_SMILES']
     with open(filepath, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        sorted_front = sorted(front, key=lambda x: -x['fitness'])
+        sorted_front = sorted(
+            front, key=lambda x: -sum(x['obj_vec'])
+        )
         for rank, entry in enumerate(sorted_front, 1):
             obj = entry.get('objectives', {})
             smiles_list = entry.get('smiles', [])
             writer.writerow({
                 'Rank': rank,
-                'Fitness': f"{entry['fitness']:.6f}",
-                'Mean_QED': f"{obj.get('mean_qed', 0):.6f}",
-                'Val_x_Uniq': f"{obj.get('val_x_uniq', 0):.6f}",
+                'Validity': f"{obj.get('validity', 0):.6f}",
+                'Uniqueness': f"{obj.get('uniqueness', 0):.6f}",
                 'N_Molecules': len(smiles_list),
                 'Top_SMILES': '; '.join(smiles_list[:5]),
             })
@@ -511,8 +479,6 @@ def main():
                         help="QPSO 最大迭代次數 T (default: 30)")
     parser.add_argument("--shots", type=int, default=512,
                         help="每次量子取樣的 shots 數 (default: 512)")
-    parser.add_argument("--alpha", type=float, default=0.4,
-                        help="適應度權重: α×validity + (1-α)×QED (default: 0.4)")
     parser.add_argument("--alpha_max", type=float, default=1.0,
                         help="QPSO 收縮-擴張係數最大值 (default: 1.0)")
     parser.add_argument("--alpha_min", type=float, default=0.5,
@@ -593,19 +559,16 @@ def main():
 
     pareto_archive = ParetoArchive(
         max_size=100,
-        objectives=('mean_qed', 'val_x_uniq'),
+        objectives=('validity', 'uniqueness'),
     )
 
     fitness_fn = create_fitness_function(
         kernel=kernel,
         decoder=decoder,
-        alpha=args.alpha,
         verbose_eval=args.verbose_eval,
-        pareto_archive=pareto_archive,
     )
-    print(f"  Fitness = w1×QED + w2×SA + w3×Size_Reward + w4×Conn − Penalty")
-    print(f"  Alpha (探索 vs 利用): {args.alpha}")
-    print(f"  Pareto Archive 已初始化 (max_size=100, obj=mean_qed × val×uniq)")
+    print(f"  目標: 同時最大化 Validity 與 Uniqueness（雙目標）")
+    print(f"  Pareto Archive 已初始化 (max_size=100)")
 
     # ================================================================
     # Step 5: 初始化 Evaluator & 回呼
@@ -630,17 +593,18 @@ def main():
     print(f"  輸出目錄: {args.output_dir}")
 
     # ================================================================
-    # Step 6: 初始化 QPSO 優化器
+    # Step 6: 初始化 MOQPSO 多目標優化器
     # ================================================================
     print(f"\n{'─' * 70}")
-    print("Step 6: 初始化 QPSO 量子粒子群優化器")
-    print(f"{'─' * 70}")
+    print(f"Step 6: 初始化 MOQPSO 多目標量子粒子群優化器")
+    print(f"{'\u2500' * 70}")
 
-    optimizer = QuantumOptimizer(
+    optimizer = MOQPSOOptimizer(
         n_params=kernel.n_params,
         n_particles=args.particles,
         max_iterations=args.iterations,
         fitness_fn=fitness_fn,
+        archive=pareto_archive,
         alpha_max=args.alpha_max,
         alpha_min=args.alpha_min,
         seed=args.seed,
@@ -649,17 +613,18 @@ def main():
     )
 
     # ================================================================
-    # Step 7: 執行 QPSO 優化（含迭代指標收集）
+    # Step 7: 執行 MOQPSO 多目標優化（含迭代指標收集）
     # ================================================================
     print(f"\n{'─' * 70}")
-    print("Step 7: 執行 QPSO 優化迭代")
-    print(f"{'─' * 70}")
+    print(f"Step 7: 執行 MOQPSO 多目標優化迭代")
+    print(f"{'\u2500' * 70}")
 
     start_time = time.time()
-    best_params, best_fitness, history = optimizer.optimize()
+    best_params, best_obj, history = optimizer.optimize()
     elapsed = time.time() - start_time
 
     print(f"\n總耗時: {elapsed:.1f} 秒 ({elapsed / 60:.1f} 分鐘)")
+    print(f"  最優折中解: validity={best_obj[0]:.4f}, uniqueness={best_obj[1]:.4f}")
     print(f"  extended_history 已收集 {len(extended_history)} 輪真實指標")
 
     # ================================================================
@@ -700,13 +665,14 @@ def main():
 
     # ── 收斂曲線資料（ASCII）──
     print(f"\n{'─' * 70}")
-    print("收斂曲線（gbest fitness vs. iteration）：")
+    print("收斂曲線（best validity + uniqueness vs. iteration）：")
     print(f"{'─' * 70}")
-    iters, fitnesses = optimizer.get_convergence_curve()
-    for it, fit in zip(iters, fitnesses):
-        bar_len = int(fit * 50)
+    iters, best_vals, best_uniqs = optimizer.get_convergence_curve()
+    for it, bv, bu in zip(iters, best_vals, best_uniqs):
+        combined = bv + bu
+        bar_len = int(combined * 25)  # max = 2.0 → 50 chars
         bar = "█" * bar_len + "░" * (50 - bar_len)
-        print(f"  Iter {it + 1:3d}: {bar} {fit:.4f}")
+        print(f"  Iter {it + 1:3d}: {bar} val={bv:.3f} uniq={bu:.3f}")
 
     # ================================================================
     # Step 9: CSV 匯出 & 視覺化

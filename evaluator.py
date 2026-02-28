@@ -178,24 +178,25 @@ class MoleculeEvaluator:
         }
 
     def evaluate_from_counts(
-        self, counts: Dict[str, int], decoder, alpha: float = 0.4
-    ) -> Tuple[float, Dict[str, float], List[Dict]]:
+        self, counts: Dict[str, int], decoder,
+    ) -> Tuple[Tuple[float, float], Dict[str, float], List[Dict]]:
         """
-        直接從 bit-string 計數字典計算適應度與完整指標。
+        直接從 bit-string 計數字典計算目標值與完整指標。
 
-        便利方法，整合 decoder.decode_counts() + compute_fitness + evaluate。
+        便利方法，整合 decoder.compute_fitness() + evaluate()。
+
+        v5 變更：compute_fitness 回傳 (validity, uniqueness) 元組。
 
         Args:
             counts:  {bitstring: count} 字典
             decoder: MoleculeDecoder 實例
-            alpha:   適應度權重
 
         Returns:
-            (fitness, metrics, decoded_results)
+            ((validity, uniqueness), metrics, decoded_results)
         """
-        fitness, decoded = decoder.compute_fitness(counts, alpha=alpha)
+        (validity, uniqueness), decoded = decoder.compute_fitness(counts)
         metrics = self.evaluate(decoded)
-        return fitness, metrics, decoded
+        return (validity, uniqueness), metrics, decoded
 
     @staticmethod
     def _empty_metrics() -> Dict[str, float]:
