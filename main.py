@@ -1,6 +1,6 @@
 """
 ==============================================================================
-SQMG Main Loop — 可擴展量子分子生成系統 主流程
+SQMG Main Loop — 可擴展量子分子生成系統 主流程 (Multi-GPU Ready)
 ==============================================================================
 
 本模組整合六大核心元件：
@@ -14,26 +14,16 @@ SQMG Main Loop — 可擴展量子分子生成系統 主流程
 執行方式：
     python main.py [--max_atoms N] [--particles M] [--iterations T] [--shots S]
 
-環境需求：
-    ┌──────────────────────────────────────────────────────┐
-    │ ⚠ 重要：numpy 必須 < 2.0（Numpy 2.0+ 的 C++ ABI     │
-    │   變更會導致 RDKit 崩潰！）                           │
-    │                                                      │
-    │   pip install "numpy>=1.24,<2.0"                     │
-    │   pip install rdkit                                  │
-    │   pip install cuda-quantum-cu12  (or cu11)           │
-    └──────────────────────────────────────────────────────┘
-
 CUDA-Q 後端設定：
     • 'qpp-cpu'    — CPU 模擬（預設，不需 GPU）
     • 'nvidia'     — GPU 態向量模擬（需要 NVIDIA GPU + CUDA）
     • 'tensornet'  — GPU 張量網路模擬（大 N 時推薦）
-
-    可透過 CUDAQ_DEFAULT_SIMULATOR 環境變數或 cudaq.set_target() 設定。
+    • 'nvidia-mgq' — 多 GPU 分散式模擬 (需透過 mpirun 啟動)
 ==============================================================================
 """
 
 import argparse
+import builtins
 import csv
 import os
 import sys
@@ -43,6 +33,27 @@ from typing import Dict, List
 
 import numpy as np
 
+# ============================================================================
+# MPI 多 GPU 環境設定 (避免輸出混亂與檔案寫入衝突)
+# ============================================================================
+def get_mpi_rank():
+    """獲取當前 MPI Process 的 Rank，若無 MPI 則回傳 0"""
+    for env_var in ['OMPI_COMM_WORLD_RANK', 'PMI_RANK', 'MV2_COMM_WORLD_RANK']:
+        if env_var in os.environ:
+            return int(os.environ[env_var])
+    return 0
+
+MPI_RANK = get_mpi_rank()
+IS_MAIN_PROCESS = (MPI_RANK == 0)
+
+# 覆寫內建 print，只允許 Rank 0 輸出，保持終端機乾淨
+_original_print = builtins.print
+def rank0_print(*args, **kwargs):
+    if IS_MAIN_PROCESS:
+        _original_print(*args, **kwargs)
+builtins.print = rank0_print
+
+
 # ── CUDA-Q Import ──
 try:
     import cudaq
@@ -51,7 +62,6 @@ except ImportError:
     print("錯誤：無法匯入 CUDA-Q (cudaq)。")
     print("請先安裝 CUDA-Q：")
     print("  pip install cuda-quantum-cu12")
-    print("或參考 https://nvidia.github.io/cuda-quantum/latest/install.html")
     print("=" * 70)
     sys.exit(1)
 
@@ -59,7 +69,7 @@ except ImportError:
 try:
     from rdkit import Chem
     from rdkit import RDLogger
-    # 抑制 RDKit 的冗長警告訊息（無效分子會產生大量 WARNING）
+    # 抑制 RDKit 的冗長警告訊息
     RDLogger.logger().setLevel(RDLogger.ERROR)
 except ImportError:
     print("=" * 70)
@@ -85,23 +95,13 @@ from plot_utils import plot_all
 def configure_cudaq_backend(target: str = "qpp-cpu"):
     """
     設定 CUDA-Q 模擬後端。
-
-    Args:
-        target: 後端名稱
-            'qpp-cpu'   — C++ 態向量模擬器（CPU，適合小 N）
-            'nvidia'    — GPU 態向量模擬器（需 NVIDIA GPU）
-            'tensornet' — GPU 張量網路模擬器（大 N 推薦，需 GPU）
-
-    CUDA-Q 注意：
-        set_target() 必須在任何 kernel 呼叫前執行。
-        切換後端後，已編譯的 kernel 會自動重新編譯。
     """
     try:
         cudaq.set_target(target)
         print(f"[CUDA-Q] 後端已設定為: {target}")
     except Exception as e:
         print(f"[CUDA-Q] 警告：無法設定後端 '{target}'，使用預設後端。")
-        print(f"         錯誤訊息: {e}")
+        print(f"        錯誤訊息: {e}")
         try:
             cudaq.set_target("qpp-cpu")
             print("[CUDA-Q] 已降級為 qpp-cpu 後端。")
@@ -118,35 +118,10 @@ def create_fitness_function(
     decoder: MoleculeDecoder,
     verbose_eval: bool = False,
 ):
-    """
-    建立連接 CUDA-Q kernel ↔ MoleculeDecoder ↔ MOQPSO 的雙目標函式。
-
-    v5 重大變更：
-      • 回傳值從單一標量 fitness 顯變為 (validity, uniqueness) 元組
-      • 完全移除 QED / SA / Penalty，只追蹤兩個目標
-      • MOQPSO 直接使用此元組進行 Pareto 支配判定
-
-    Args:
-        kernel:       SQMGKernel 實例
-        decoder:      MoleculeDecoder 實例
-        verbose_eval: 若 True，每次評估都印出詳細結果
-
-    Returns:
-        fitness_fn: Callable[[np.ndarray], Tuple[float, float]]
-    """
     eval_count = [0]
 
     def fitness_fn(params: np.ndarray):
-        """
-        雙目標適應度評估函式。
-
-        流程：
-        1. params → CUDA-Q kernel (cudaq.sample)
-        2. bit-strings → MoleculeDecoder
-        3. 分子 → RDKit → (validity, uniqueness)
-        """
         eval_count[0] += 1
-
         try:
             counts = kernel.sample(params)
             (validity, uniqueness), decoded = decoder.compute_fitness(counts)
@@ -163,7 +138,6 @@ def create_fitness_function(
                     f"val={validity:.4f} "
                     f"uniq={uniqueness:.4f}"
                 )
-
             return (validity, uniqueness)
 
         except Exception as e:
@@ -175,7 +149,7 @@ def create_fitness_function(
 
 
 # ============================================================================
-# 迭代回呼 — 每輪收集 Validity / Uniqueness / Novelty / Mean QED
+# 迭代回呼
 # ============================================================================
 
 def create_iteration_callback(
@@ -185,37 +159,11 @@ def create_iteration_callback(
     extended_history: List[Dict],
     all_molecules: List[Dict],
 ):
-    """
-    建立 QPSO iteration_callback，用於每輪結束後評估 gbest 並記錄指標。
-
-    每一輪迭代結束時，optimizer 會把 gbest_params 放在 record 中傳進來，
-    callback 用這組參數進行 sample → decode → evaluate，將真實的
-    Validity / Uniqueness / Novelty / Mean_QED 寫入 extended_history。
-
-    Args:
-        kernel:           SQMGKernel 實例
-        decoder:          MoleculeDecoder 實例
-        evaluator:        MoleculeEvaluator 實例
-        extended_history:  存放每輪指標的外部列表（會被 mutation 填充）
-        all_molecules:     累積所有有效分子的外部列表
-
-    Returns:
-        callback: Callable[[int, dict], None]
-    """
-    # 用 set 做跨輪去重，避免每輪都重建
     _seen_smiles: set = set()
     for m in all_molecules:
         _seen_smiles.add(m['smiles'])
 
     def callback(iteration: int, record: dict):
-        """
-        在每輪 QPSO 迭代結束後被呼叫。
-        使用 record['gbest_params'] 重新取樣並計算評估指標。
-
-        重要：此處的 evaluator.evaluate() 只計算 valid=True
-        （完全通過 SanitizeMol）的分子，不包含 partial_valid。
-        """
-        # ── 預設值（若評估失敗仍有合理紀錄）──
         validity = 0.0
         uniqueness = 0.0
         novelty = 0.0
@@ -228,9 +176,6 @@ def create_iteration_callback(
             try:
                 counts = kernel.sample(gbest_params)
                 decoded = decoder.decode_counts(counts)
-
-                # evaluator.evaluate 只計算 valid=True 的分子
-                # （partial_valid 不會被納入 Validity/Uniqueness/Novelty）
                 metrics = evaluator.evaluate(decoded)
 
                 validity = metrics['validity']
@@ -238,7 +183,6 @@ def create_iteration_callback(
                 novelty = metrics['novelty']
                 mean_qed = metrics['mean_qed']
 
-                # 累積有效分子（跨輪去重，只取 valid=True）
                 for r in decoded:
                     if r.get('valid') and not r.get('partial_valid'):
                         smi = r.get('smiles')
@@ -263,7 +207,6 @@ def create_iteration_callback(
             'uniqueness': uniqueness,
             'novelty': novelty,
             'mean_qed': mean_qed,
-            # v3: QPSO 抗停滯診斷指標
             'diversity': record.get('diversity', 0),
             'stagnation_counter': record.get('stagnation_counter', 0),
             'n_mutated': record.get('n_mutated', 0),
@@ -278,7 +221,6 @@ def create_iteration_callback(
 # ============================================================================
 
 def export_history_csv(history: List[Dict], filepath: str):
-    """匯出迭代歷史指標至 CSV 檔案（含 v3 抗停滯診斷欄位）。"""
     if not history:
         return
     fieldnames = [
@@ -305,9 +247,7 @@ def export_history_csv(history: List[Dict], filepath: str):
             })
     print(f"  歷史指標已匯出至: {filepath}")
 
-
 def export_molecules_csv(molecules: List[Dict], filepath: str):
-    """匯出所有生成的有效分子至 CSV 檔案。"""
     if not molecules:
         return
     fieldnames = ['SMILES', 'QED']
@@ -322,20 +262,15 @@ def export_molecules_csv(molecules: List[Dict], filepath: str):
             })
     print(f"  分子列表已匯出至: {filepath}")
 
-
 def export_archive_csv(archive: ParetoArchive, filepath: str):
-    """匯出 Pareto Archive 非支配解至 CSV 檔案（v5 MOQPSO 版本）。"""
     front = archive.get_pareto_front()
     if not front:
         return
-    fieldnames = ['Rank', 'Validity', 'Uniqueness',
-                  'N_Molecules', 'Top_SMILES']
+    fieldnames = ['Rank', 'Validity', 'Uniqueness', 'N_Molecules', 'Top_SMILES']
     with open(filepath, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        sorted_front = sorted(
-            front, key=lambda x: -sum(x['obj_vec'])
-        )
+        sorted_front = sorted(front, key=lambda x: -sum(x['obj_vec']))
         for rank, entry in enumerate(sorted_front, 1):
             obj = entry.get('objectives', {})
             smiles_list = entry.get('smiles', [])
@@ -353,34 +288,17 @@ def export_archive_csv(archive: ParetoArchive, filepath: str):
 # 結果分析與輸出
 # ============================================================================
 
-def analyze_best_result(
-    best_params: np.ndarray,
-    kernel: SQMGKernel,
-    decoder: MoleculeDecoder,
-):
-    """
-    對最佳參數進行詳細分析並輸出結果。
-
-    Args:
-        best_params: QPSO 找到的最佳參數
-        kernel:      SQMGKernel 實例
-        decoder:     MoleculeDecoder 實例
-    """
+def analyze_best_result(best_params: np.ndarray, kernel: SQMGKernel, decoder: MoleculeDecoder):
     print("\n" + "=" * 70)
     print("最終結果分析")
     print("=" * 70)
 
-    # 使用更多 shots 進行最終取樣以獲得更精確的統計
     original_shots = kernel.shots
     kernel.shots = max(original_shots * 4, 4096)
-
     counts = kernel.sample(best_params)
     decoded = decoder.decode_counts(counts)
-
-    # 恢復原始 shots
     kernel.shots = original_shots
 
-    # ── 統計彙整 ──
     total_unique = len(decoded)
     valid_results = [r for r in decoded if r['valid']]
     n_valid = len(valid_results)
@@ -396,7 +314,6 @@ def analyze_best_result(
         print(f"  平均 QED           : {np.mean(qeds):.4f}")
         print(f"  最高 QED           : {np.max(qeds):.4f}")
 
-        # ── 所有有效分子排序輸出 ──
         print(f"\n所有有效分子（按 QED 降序）：")
         print(f"{'排名':>4}  {'SMILES':30s}  {'QED':>8}  {'計數':>6}  {'原子碼':20s}  {'鍵碼':15s}")
         print("-" * 90)
@@ -411,7 +328,6 @@ def analyze_best_result(
                 f"{atom_str:20s}  {bond_str:15s}"
             )
 
-        # ── 最佳分子詳細資訊 ──
         best_mol_record = sorted_valid[0]
         print(f"\n★ 最佳分子：")
         print(f"  SMILES   : {best_mol_record['smiles']}")
@@ -420,12 +336,8 @@ def analyze_best_result(
         print(f"  原子碼   : {best_mol_record['atom_codes']}")
         print(f"  鍵碼     : {best_mol_record['bond_codes']}")
     else:
-        print("\n⚠ 未找到有效分子。建議：")
-        print("  1. 增加粒子數（--particles）或迭代次數（--iterations）")
-        print("  2. 增加取樣次數（--shots）")
-        print("  3. 調整 α 權重以更重視有效性")
+        print("\n⚠ 未找到有效分子。")
 
-    # ── 輸出最佳參數（供後續使用）──
     print(f"\n最佳參數向量（可用於重現結果）：")
     print(f"  np.array({best_params.tolist()})")
 
@@ -437,39 +349,9 @@ def analyze_best_result(
 # ============================================================================
 
 def main():
-    """
-    SQMG 主流程：初始化 → QPSO 優化迭代 → 結果輸出。
-
-    這是整個「可擴展量子分子生成系統」的進入點。
-    流程概覽：
-    ┌────────────────────────────────────────────────────────┐
-    │ 1. 設定 CUDA-Q 後端                                    │
-    │ 2. 初始化 SQMGKernel (3N+2 量子線路)                   │
-    │ 3. 初始化 MoleculeDecoder (bit-string → 分子)          │
-    │ 4. 建立適應度函式 (kernel + decoder → fitness)          │
-    │ 5. 初始化 QuantumOptimizer (QPSO)                      │
-    │ 6. 執行 QPSO 優化迭代                                  │
-    │    ┌──────────────────────────────────────────────────┐ │
-    │    │ for each iteration:                             │ │
-    │    │   for each particle:                            │ │
-    │    │     params → CUDA-Q sample → decode → fitness   │ │
-    │    │   update pbest, gbest, positions (QPSO)         │ │
-    │    └──────────────────────────────────────────────────┘ │
-    │ 7. 分析最佳結果，輸出高分分子                            │
-    └────────────────────────────────────────────────────────┘
-    """
-
-    # ── 命令列參數 ──
     parser = argparse.ArgumentParser(
-        description="SQMG — 可擴展量子分子生成系統 (Scalable Quantum Molecular Generation)",
+        description="SQMG — 可擴展量子分子生成系統 (Multi-GPU Ready)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-範例：
-  python main.py                         # 使用預設參數
-  python main.py --max_atoms 6           # 支持最多 6 個重原子
-  python main.py --particles 30 --iterations 100  # 更多粒子和迭代
-  python main.py --backend tensornet     # 使用 GPU 張量網路後端
-        """
     )
     parser.add_argument("--max_atoms", type=int, default=4,
                         help="最大重原子數量 N (default: 4)")
@@ -484,8 +366,8 @@ def main():
     parser.add_argument("--alpha_min", type=float, default=0.5,
                         help="QPSO 收縮-擴張係數最小值 (default: 0.5)")
     parser.add_argument("--backend", type=str, default="qpp-cpu",
-                        choices=["qpp-cpu", "nvidia", "tensornet"],
-                        help="CUDA-Q 模擬後端 (default: qpp-cpu)")
+                        choices=["qpp-cpu", "nvidia", "tensornet", "nvidia-mgq"],
+                        help="CUDA-Q 模擬後端 (新增 nvidia-mgq 支援多 GPU 分散運算)")
     parser.add_argument("--seed", type=int, default=42,
                         help="隨機數種子 (default: 42)")
     parser.add_argument("--verbose_eval", action="store_true",
@@ -498,107 +380,42 @@ def main():
 
     args = parser.parse_args()
 
-    # 建立輸出目錄
+    # 建立輸出目錄 (所有 Rank 都可以安全執行，exist_ok 保證不報錯)
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # ── 系統資訊 ──
     print("╔" + "═" * 68 + "╗")
     print("║  SQMG — 可擴展量子分子生成系統                                     ║")
     print("║  Scalable Quantum Molecular Generation with CUDA-Q & QPSO         ║")
     print("╚" + "═" * 68 + "╝")
     print(f"\n啟動時間: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"CUDA-Q 版本: {cudaq.__version__ if hasattr(cudaq, '__version__') else '未知'}")
-    print(f"Python 版本: {sys.version.split()[0]}")
-    print(f"NumPy 版本 : {np.__version__}")
-
-    # ── 檢查 NumPy 版本 ──
-    np_major = int(np.__version__.split('.')[0])
-    if np_major >= 2:
-        print("\n⚠  警告：偵測到 NumPy 2.0+！")
-        print("   Numpy 2.0 的 C++ ABI 變更可能導致 RDKit 崩潰。")
-        print("   強烈建議降級：pip install 'numpy>=1.24,<2.0'")
+    print(f"MPI Rank: {MPI_RANK} (Main Process: {IS_MAIN_PROCESS})")
 
     # ================================================================
-    # Step 1: 設定 CUDA-Q 後端
+    # Step 1~6: 初始化元件
     # ================================================================
-    print(f"\n{'─' * 70}")
-    print("Step 1: 設定 CUDA-Q 模擬後端")
-    print(f"{'─' * 70}")
+    print(f"\n{'─' * 70}\nStep 1: 設定 CUDA-Q 模擬後端\n{'─' * 70}")
     configure_cudaq_backend(args.backend)
 
-    # ================================================================
-    # Step 2: 初始化 SQMGKernel
-    # ================================================================
-    print(f"\n{'─' * 70}")
-    print("Step 2: 初始化 SQMG 3N+2 量子線路")
-    print(f"{'─' * 70}")
-
+    print(f"\n{'─' * 70}\nStep 2: 初始化 SQMG 3N+2 量子線路\n{'─' * 70}")
     kernel = SQMGKernel(max_atoms=args.max_atoms, shots=args.shots)
     print(kernel.describe())
 
-    # ================================================================
-    # Step 3: 初始化 MoleculeDecoder
-    # ================================================================
-    print(f"\n{'─' * 70}")
-    print("Step 3: 初始化分子解碼器")
-    print(f"{'─' * 70}")
-
+    print(f"\n{'─' * 70}\nStep 3: 初始化分子解碼器\n{'─' * 70}")
     decoder = MoleculeDecoder(max_atoms=args.max_atoms)
-    print(f"  Max atoms         : {decoder.max_atoms}")
-    print(f"  Expected BS length: {decoder.expected_length}")
-    print(f"  Atom mapping      : 000→NONE, 001→C, 010→O, 011→N, "
-          f"100→S, 101→P, 110→F, 111→Cl")
-    print(f"  Bond mapping      : 00→None, 01→Single, 10→Double, 11→Triple")
 
-    # ================================================================
-    # Step 4: 建立適應度函式
-    # ================================================================
-    print(f"\n{'─' * 70}")
-    print("Step 4: 建立適應度函式")
-    print(f"{'─' * 70}")
+    print(f"\n{'─' * 70}\nStep 4: 建立適應度函式\n{'─' * 70}")
+    pareto_archive = ParetoArchive(max_size=100, objectives=('validity', 'uniqueness'))
+    fitness_fn = create_fitness_function(kernel, decoder, args.verbose_eval)
 
-    pareto_archive = ParetoArchive(
-        max_size=100,
-        objectives=('validity', 'uniqueness'),
-    )
-
-    fitness_fn = create_fitness_function(
-        kernel=kernel,
-        decoder=decoder,
-        verbose_eval=args.verbose_eval,
-    )
-    print(f"  目標: 同時最大化 Validity 與 Uniqueness（雙目標）")
-    print(f"  Pareto Archive 已初始化 (max_size=100)")
-
-    # ================================================================
-    # Step 5: 初始化 Evaluator & 回呼
-    # ================================================================
-    print(f"\n{'─' * 70}")
-    print("Step 5: 初始化 MoleculeEvaluator & 迭代回呼")
-    print(f"{'─' * 70}")
-
+    print(f"\n{'─' * 70}\nStep 5: 初始化 MoleculeEvaluator & 迭代回呼\n{'─' * 70}")
     evaluator = MoleculeEvaluator()
     extended_history: List[Dict] = []
     all_molecules: List[Dict] = []
-
     iteration_callback = create_iteration_callback(
-        kernel=kernel,
-        decoder=decoder,
-        evaluator=evaluator,
-        extended_history=extended_history,
-        all_molecules=all_molecules,
+        kernel, decoder, evaluator, extended_history, all_molecules
     )
-    print("  MoleculeEvaluator 已初始化")
-    print(f"  參考分子集大小: {len(evaluator.reference_smiles)}")
-    print(f"  輸出目錄: {args.output_dir}")
 
-    # ================================================================
-    # Step 6: 初始化 MOQPSO 多目標優化器
-    # ================================================================
-    print(f"\n{'─' * 70}")
-    print(f"Step 6: 初始化 MOQPSO 多目標量子粒子群優化器")
-    print(f"{'\u2500' * 70}")
-
+    print(f"\n{'─' * 70}\nStep 6: 初始化 MOQPSO 多目標量子粒子群優化器\n{'─' * 70}")
     optimizer = MOQPSOOptimizer(
         n_params=kernel.n_params,
         n_particles=args.particles,
@@ -613,117 +430,58 @@ def main():
     )
 
     # ================================================================
-    # Step 7: 執行 MOQPSO 多目標優化（含迭代指標收集）
+    # Step 7: 執行 MOQPSO 多目標優化
     # ================================================================
-    print(f"\n{'─' * 70}")
-    print(f"Step 7: 執行 MOQPSO 多目標優化迭代")
-    print(f"{'\u2500' * 70}")
-
+    print(f"\n{'─' * 70}\nStep 7: 執行 MOQPSO 多目標優化迭代\n{'─' * 70}")
     start_time = time.time()
     best_params, best_obj, history = optimizer.optimize()
     elapsed = time.time() - start_time
 
     print(f"\n總耗時: {elapsed:.1f} 秒 ({elapsed / 60:.1f} 分鐘)")
     print(f"  最優折中解: validity={best_obj[0]:.4f}, uniqueness={best_obj[1]:.4f}")
-    print(f"  extended_history 已收集 {len(extended_history)} 輪真實指標")
 
     # ================================================================
     # Step 8: 分析最佳結果
     # ================================================================
-    print(f"\n{'─' * 70}")
-    print("Step 8: 分析最佳結果")
-    print(f"{'─' * 70}")
-
+    print(f"\n{'─' * 70}\nStep 8: 分析最佳結果\n{'─' * 70}")
     valid_results = analyze_best_result(best_params, kernel, decoder)
 
-    # 將 analyze 結果中的有效分子也加入 all_molecules
-    # 只取 valid=True 且 partial_valid 非 True 的分子
     if valid_results:
         existing_smiles = {m['smiles'] for m in all_molecules}
         for r in valid_results:
             smi = r.get('smiles')
             if smi and not r.get('partial_valid') and smi not in existing_smiles:
                 all_molecules.append({
-                    'smiles': smi,
-                    'qed': r['qed'],
-                    'mol': r.get('mol'),
+                    'smiles': smi, 'qed': r['qed'], 'mol': r.get('mol'),
                 })
                 existing_smiles.add(smi)
 
-    # ── 最終評估指標 ──
-    print(f"\n{'─' * 70}")
-    print("評估指標 (Validity / Uniqueness / Novelty)：")
-    print(f"{'─' * 70}")
-
-    if valid_results:
-        # 用最終取樣結果做完整評估
-        final_decoded = []
-        counts_final = kernel.sample(best_params)
-        final_decoded = decoder.decode_counts(counts_final)
-        final_metrics = evaluator.evaluate(final_decoded)
-        print(evaluator.format_metrics(final_metrics))
-
-    # ── 收斂曲線資料（ASCII）──
-    print(f"\n{'─' * 70}")
-    print("收斂曲線（best validity + uniqueness vs. iteration）：")
-    print(f"{'─' * 70}")
-    iters, best_vals, best_uniqs = optimizer.get_convergence_curve()
-    for it, bv, bu in zip(iters, best_vals, best_uniqs):
-        combined = bv + bu
-        bar_len = int(combined * 25)  # max = 2.0 → 50 chars
-        bar = "█" * bar_len + "░" * (50 - bar_len)
-        print(f"  Iter {it + 1:3d}: {bar} val={bv:.3f} uniq={bu:.3f}")
-
     # ================================================================
-    # Step 9: CSV 匯出 & 視覺化
+    # Step 9: CSV 匯出 & 視覺化 (僅限主程序執行)
     # ================================================================
-    print(f"\n{'─' * 70}")
-    print("Step 9: CSV 匯出 & 視覺化")
-    print(f"{'─' * 70}")
+    if IS_MAIN_PROCESS:
+        print(f"\n{'─' * 70}\nStep 9: CSV 匯出 & 視覺化\n{'─' * 70}")
 
-    # CSV 匯出
-    export_history_csv(
-        extended_history,
-        os.path.join(args.output_dir, "history_metrics.csv"),
-    )
-    export_molecules_csv(
-        all_molecules,
-        os.path.join(args.output_dir, "generated_molecules.csv"),
-    )
-    export_archive_csv(
-        pareto_archive,
-        os.path.join(args.output_dir, "pareto_archive.csv"),
-    )
+        export_history_csv(extended_history, os.path.join(args.output_dir, "history_metrics.csv"))
+        export_molecules_csv(all_molecules, os.path.join(args.output_dir, "generated_molecules.csv"))
+        export_archive_csv(pareto_archive, os.path.join(args.output_dir, "pareto_archive.csv"))
 
-    # Pareto Archive 摘要
-    print(f"\n{'\u2500' * 70}")
-    print("Pareto Archive (非支配解)\uff1a")
-    print(f"{'\u2500' * 70}")
-    print(pareto_archive.summary())
+        try:
+            plot_paths = plot_all(
+                history=extended_history,
+                molecules=all_molecules,
+                output_dir=args.output_dir,
+                show=False,
+                dimred_method=args.dimred,
+            )
+            print(f"\n  已生成 {len(plot_paths)} 張圖表。")
+        except Exception as e:
+            print(f"\n  [視覺化警告] 圖表生成失敗: {e}")
 
-    # 視覺化圖表
-    try:
-        plot_paths = plot_all(
-            history=extended_history,
-            molecules=all_molecules,
-            output_dir=args.output_dir,
-            show=False,
-            dimred_method=args.dimred,
-        )
-        print(f"\n  已生成 {len(plot_paths)} 張圖表。")
-    except Exception as e:
-        print(f"\n  [視覺化警告] 圖表生成失敗: {e}")
-        print("  （可能缺少 matplotlib / seaborn / scikit-learn）")
-
-    print(f"\n{'═' * 70}")
-    print("SQMG 執行完成。所有結果已輸出至:")
-    print(f"  {os.path.abspath(args.output_dir)}")
-    print(f"{'═' * 70}")
-
-
-# ============================================================================
-# Entry Point
-# ============================================================================
+        print(f"\n{'═' * 70}")
+        print("SQMG 執行完成。所有結果已輸出至:")
+        print(f"  {os.path.abspath(args.output_dir)}")
+        print(f"{'═' * 70}")
 
 if __name__ == "__main__":
     main()
