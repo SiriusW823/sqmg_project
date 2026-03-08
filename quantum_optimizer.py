@@ -246,19 +246,29 @@ class ParetoArchive:
         return distances
 
     # ────────────────────────────────────────────────────────────
-    # Archive Leader 選擇（擁擠距離輪盤）
+    # Archive Leader 選擇（邊界保護 + 乘積偏好輪盤）
     # ────────────────────────────────────────────────────────────
 
-    def select_leader(self, rng: np.random.Generator) -> Optional[np.ndarray]:
+    def select_leader(
+        self, rng: np.random.Generator,
+        boundary_weight: float = 0.25,
+        softmax_temp: float = 5.0,
+    ) -> Optional[np.ndarray]:
         """
-        從 Archive 中以擁擠距離為權重進行輪盤選擇，
-        取出一組參數作為粒子的吸引子 (guide)。
+        從 Archive 中以「邊界絕對保護 + 最大乘積偏好」輪盤選擇 Leader。
 
-        擁擠距離越大 → 被選中機率越高
-        → 促使粒子群探索 Pareto 前緣的不同區域。
+        權重設計（雙層機制）：
+        1. 邊界解（擁有最高 Validity 或最高 Uniqueness 的解）：
+           賦予固定總權重 (boundary_weight)，
+           確保 Pareto 前緣的極端探索不被放棄。
+        2. 非邊界解：
+           使用 Softmax(Validity×Uniqueness / temp) 計算權重，
+           乘積越大→壓倒性高機率被選→集中收斂到甲區。
 
         Args:
-            rng: NumPy 隨機數生成器
+            rng:              NumPy 隨機數生成器
+            boundary_weight:  邊界解佔總權重的比例（預設 0.25）
+            softmax_temp:     Softmax 溫度（越低越集中，預設 5.0）
 
         Returns:
             選中解的參數向量 (D,)，若 Archive 為空則回傳 None
@@ -268,24 +278,50 @@ class ParetoArchive:
         if len(self.archive) == 1:
             return self.archive[0]['params'].copy()
 
-        distances = self._compute_crowding_distances(self.archive)
+        n = len(self.archive)
 
-        # ∞ 替換為有限最大值的 2 倍（確保邊界解高機率被選）
-        max_finite = max(
-            (d for d in distances if d != float('inf')),
-            default=1.0,
-        )
-        weights = [
-            d if d != float('inf') else max_finite * 2.0
-            for d in distances
-        ]
+        # ── 識別邊界解（擁有最高 Validity 或最高 Uniqueness） ──
+        boundary_set = set()
+        for m in range(len(self.obj_keys)):
+            best_idx = max(range(n), key=lambda i: self.archive[i]['obj_vec'][m])
+            boundary_set.add(best_idx)
 
-        total = sum(weights)
-        if total < 1e-12:
-            idx = rng.integers(0, len(self.archive))
+        # ── 計算乘積向量 ──
+        products = np.array([
+            e['obj_vec'][0] * e['obj_vec'][1] for e in self.archive
+        ])
+
+        # ── 非邊界解的 Softmax 權重 ──
+        non_boundary_indices = [i for i in range(n) if i not in boundary_set]
+
+        weights = np.zeros(n)
+
+        if non_boundary_indices:
+            nb_products = products[non_boundary_indices]
+            # Softmax: exp(product / temp) → 乘積越高權重壓倒性越大
+            nb_scores = nb_products / max(softmax_temp, 1e-8)
+            nb_scores -= nb_scores.max()  # 數值穩定性
+            nb_exp = np.exp(nb_scores)
+            nb_probs = nb_exp / nb_exp.sum()
+            # 非邊界解分配 (1 - boundary_weight) 的總權重
+            for k, idx in enumerate(non_boundary_indices):
+                weights[idx] = nb_probs[k] * (1.0 - boundary_weight)
         else:
-            probs = np.array(weights) / total
-            idx = rng.choice(len(self.archive), p=probs)
+            # 全都是邊界解（Archive 僅 2 個）
+            boundary_weight = 1.0
+
+        # ── 邊界解均分固定權重 ──
+        n_boundary = len(boundary_set)
+        for idx in boundary_set:
+            weights[idx] = boundary_weight / n_boundary
+
+        # ── 輪盤選擇 ──
+        total = weights.sum()
+        if total < 1e-12:
+            idx = rng.integers(0, n)
+        else:
+            probs = weights / total
+            idx = rng.choice(n, p=probs)
 
         return self.archive[idx]['params'].copy()
 
@@ -344,18 +380,17 @@ class ParetoArchive:
 
 class MOQPSOOptimizer:
     """
-    MOQPSO (Multi-Objective Quantum Particle Swarm Optimization) — v5。
+    MOQPSO (Multi-Objective Quantum Particle Swarm Optimization) — v6。
 
-    相對於 v3 單目標 QPSO 的核心改動：
-      • fitness_fn 回傳 (validity, uniqueness) 元組（非標量）
-      • 移除固定 gbest：改用 ParetoArchive 的擁擠距離輪盤選擇 Leader
-      • pbest 更新：Pareto 支配規則 + 50% 隨機替換
-      • 保留 v3 的 Cosine Annealing α、Cauchy 變異、停滯偵測
+    v6 核心升級：
+      • select_leader：「邊界絕對保護 + Softmax 乘積偏好」雙層權重
+      • Lévy Flight 變異：取代 Cauchy，重尾分佈提升全域跳局能力
+      • 保留 Pareto Archive、pbest 支配規則、Cosine α、停滞偵測
 
     使用方式：
         archive = ParetoArchive(max_size=100)
         optimizer = MOQPSOOptimizer(
-            n_params=18,
+            n_params=60,
             n_particles=20,
             max_iterations=50,
             fitness_fn=my_fn,     # returns (validity, uniqueness)
@@ -390,7 +425,7 @@ class MOQPSOOptimizer:
         初始化 MOQPSO 優化器。
 
         Args:
-            n_params:          參數空間維度 D（= 5N − 2）
+            n_params:          參數空間維度 D（= 16N − 4）
             n_particles:       粒子數量 M（建議 15~30）
             max_iterations:    最大迭代次數 T
             fitness_fn:        目標函式 f(params) → (validity, uniqueness)
@@ -405,8 +440,8 @@ class MOQPSOOptimizer:
 
             stagnation_limit:  連續幾代 Archive 未變化就觸發重初始化
             reinit_fraction:   停滯時重初始化的粒子比例 (0~1)
-            mutation_prob:     每個粒子在每輪被 Cauchy 變異的機率
-            mutation_scale:    Cauchy 變異的尺度因子 (相對於 param range)
+            mutation_prob:     每個粒子在每輪被 Lévy Flight 變異的機率
+            mutation_scale:    Lévy Flight 變異的尺度因子 (相對於 param range)
             alpha_perturb_std: α 隨機擾動的標準差
             alpha_stag_boost:  停滯觸發時 α 的額外提升量
         """
@@ -738,9 +773,9 @@ class MOQPSOOptimizer:
         1. 計算 α（Cosine Annealing + 擾動 + 停滯提升）
         2. 計算 mbest
         3. 對每個粒子：
-           a. 從 Archive 選擇 guide（擁擠距離輪盤）
+           a. 從 Archive 選擇 guide（邊界保護 + 乘積偏好輪盤）
            b. QPSO Delta 勢阱位置更新（guide 取代固定 gbest）
-           c. 以機率 p_mut 施加 Cauchy 變異
+           c. 以機率 p_mut 施加 Lévy Flight 變異
            d. 評估目標 (validity, uniqueness)
            e. 更新 pbest（Pareto 支配規則）
            f. 嘗試加入 Archive
@@ -757,18 +792,18 @@ class MOQPSOOptimizer:
             raise ValueError("fitness_fn 未設定！請在初始化時提供目標函式。")
 
         print("=" * 70)
-        print("MOQPSO 多目標量子粒子群優化 v5 啟動")
+        print("MOQPSO 多目標量子粒子群優化 v6 啟動")
         print(f"  粒子數 (M)       : {self.M}")
         print(f"  參數維度 (D)     : {self.D}")
         print(f"  最大迭代 (T)     : {self.T}")
         print(f"  α 範圍           : {self.alpha_max} → {self.alpha_min} (cosine)")
         print(f"  參數範圍         : [{self.lb:.4f}, {self.ub:.4f}]")
         print(f"  目標             : Validity × Uniqueness（雙目標最大化）")
-        print(f"  吸引子選擇       : Pareto Archive 擁擠距離輪盤")
+        print(f"  吸引子選擇       : 邊界保護 + Softmax 乘積偏好輪盤")
         print(f"  pbest 更新       : Pareto 支配規則 + 50% 隨機替換")
-        print(f"  停滯門檻         : {self.stagnation_limit} 代")
+        print(f"  停滞門檻         : {self.stagnation_limit} 代")
         print(f"  重初始化比例     : {self.reinit_fraction:.0%}")
-        print(f"  Cauchy 變異機率  : {self.mutation_prob:.0%}")
+        print(f"  Lévy Flight 機率 : {self.mutation_prob:.0%}")
         print("=" * 70)
 
         # ── 初始適應度評估 ──
@@ -822,9 +857,9 @@ class MOQPSOOptimizer:
                     alpha=alpha,
                 )
 
-                # Step 3: Cauchy 變異
+                # Step 3: Lévy Flight 變異
                 if self.rng.random() < self.mutation_prob:
-                    self.positions[i] = self._cauchy_mutation(self.positions[i])
+                    self.positions[i] = self._levy_mutation(self.positions[i])
                     n_mutated_this_iter += 1
 
                 # Step 4: 評估新位置的目標
@@ -908,7 +943,7 @@ class MOQPSOOptimizer:
         best_obj = compromise['obj_vec'] if compromise else (0, 0)
 
         print("\n" + "=" * 70)
-        print("MOQPSO v5 優化完成")
+        print("MOQPSO v6 優化完成")
         print(f"  Archive 大小     : {len(self.archive)}")
         print(f"  最優折中解       : validity={best_obj[0]:.4f}, "
               f"uniqueness={best_obj[1]:.4f}")
