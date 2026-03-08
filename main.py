@@ -1,24 +1,25 @@
 """
 ==============================================================================
-SQMG Main Loop — 可擴展量子分子生成系統 主流程 (Multi-GPU Ready)
+SQMG Main Loop — 可擴展量子分子生成系統 主流程 (Single-Objective v6)
 ==============================================================================
 
-本模組整合六大核心元件：
-  1. SQMGKernel        — CUDA-Q 3N+2 參數化量子線路
+本模組整合五大核心元件：
+  1. SQMGKernel        — CUDA-Q 3N+3 參數化量子線路 (v5 enhanced)
   2. MoleculeDecoder   — Bit-string 到分子結構的解碼器
-  3. QuantumOptimizer  — QPSO 量子粒子群優化器
+  3. SOQPSOOptimizer   — 單目標量子粒子群優化器
   4. MoleculeEvaluator — Validity / Uniqueness / Novelty 評估指標
-  5. plot_utils        — 視覺化模組（收斂軌跡、Pareto 前緣、化學空間）
-  6. Main_Loop         — 初始化、優化迭代、指標收集、CSV 匯出、結果輸出
+  5. plot_utils        — 視覺化模組（收斂軌跡、化學空間）
+
+策略：單目標重火力打擊 — 最大化 Fitness = Validity × Uniqueness × Length_Penalty
 
 執行方式：
     python main.py [--max_atoms N] [--particles M] [--iterations T] [--shots S]
 
 CUDA-Q 後端設定：
-    • 'qpp-cpu'    — CPU 模擬（預設，不需 GPU）
-    • 'nvidia'     — GPU 態向量模擬（需要 NVIDIA GPU + CUDA）
-    • 'tensornet'  — GPU 張量網路模擬（大 N 時推薦）
-    • 'nvidia-mgq' — 多 GPU 分散式模擬 (需透過 mpirun 啟動)
+    • 'qpp-cpu'      — CPU 模擬（預設，不需 GPU）
+    • 'nvidia'       — GPU 態向量模擬（需要 NVIDIA GPU + CUDA）
+    • 'tensornet'    — GPU 張量網路模擬（大 N 時推薦）
+    • 'nvidia-mqpu'  — 多 GPU 分散式模擬 (需透過 mpirun 啟動)
 ==============================================================================
 """
 
@@ -83,7 +84,7 @@ except ImportError:
 # ── 本地模組 Import ──
 from sqmg_kernel import SQMGKernel
 from molecule_decoder import MoleculeDecoder
-from quantum_optimizer import MOQPSOOptimizer, ParetoArchive
+from quantum_optimizer import SOQPSOOptimizer
 from evaluator import MoleculeEvaluator
 from plot_utils import plot_all
 
@@ -110,7 +111,7 @@ def configure_cudaq_backend(target: str = "qpp-cpu"):
 
 
 # ============================================================================
-# 適應度函式 (Fitness Function)
+# 適應度函式 (Fitness Function) — 單目標標量回傳
 # ============================================================================
 
 def create_fitness_function(
@@ -120,11 +121,11 @@ def create_fitness_function(
 ):
     eval_count = [0]
 
-    def fitness_fn(params: np.ndarray):
+    def fitness_fn(params: np.ndarray) -> float:
         eval_count[0] += 1
         try:
             counts = kernel.sample(params)
-            (validity, uniqueness), decoded = decoder.compute_fitness(counts)
+            fitness, decoded = decoder.compute_fitness(counts)
 
             if verbose_eval:
                 valid_count = sum(
@@ -135,15 +136,14 @@ def create_fitness_function(
                     f"    [Eval #{eval_count[0]}] "
                     f"BS={len(decoded)} "
                     f"Valid={valid_count} "
-                    f"val={validity:.4f} "
-                    f"uniq={uniqueness:.4f}"
+                    f"fitness={fitness:.6f}"
                 )
-            return (validity, uniqueness)
+            return fitness
 
         except Exception as e:
             if verbose_eval:
                 print(f"    [Eval #{eval_count[0]}] 錯誤: {e}")
-            return (0.0, 0.0)
+            return 0.0
 
     return fitness_fn
 
@@ -262,27 +262,6 @@ def export_molecules_csv(molecules: List[Dict], filepath: str):
             })
     print(f"  分子列表已匯出至: {filepath}")
 
-def export_archive_csv(archive: ParetoArchive, filepath: str):
-    front = archive.get_pareto_front()
-    if not front:
-        return
-    fieldnames = ['Rank', 'Validity', 'Uniqueness', 'N_Molecules', 'Top_SMILES']
-    with open(filepath, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        sorted_front = sorted(front, key=lambda x: -sum(x['obj_vec']))
-        for rank, entry in enumerate(sorted_front, 1):
-            obj = entry.get('objectives', {})
-            smiles_list = entry.get('smiles', [])
-            writer.writerow({
-                'Rank': rank,
-                'Validity': f"{obj.get('validity', 0):.6f}",
-                'Uniqueness': f"{obj.get('uniqueness', 0):.6f}",
-                'N_Molecules': len(smiles_list),
-                'Top_SMILES': '; '.join(smiles_list[:5]),
-            })
-    print(f"  Pareto Archive 已匯出至: {filepath}")
-
 
 # ============================================================================
 # 結果分析與輸出
@@ -350,27 +329,27 @@ def analyze_best_result(best_params: np.ndarray, kernel: SQMGKernel, decoder: Mo
 
 def main():
     parser = argparse.ArgumentParser(
-        description="SQMG — 可擴展量子分子生成系統 (Multi-GPU Ready)",
+        description="SQMG — 可擴展量子分子生成系統 (Single-Objective v6)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--max_atoms", type=int, default=4,
                         help="最大重原子數量 N (default: 4)")
-    parser.add_argument("--particles", type=int, default=20,
-                        help="QPSO 粒子數量 M (default: 20)")
+    parser.add_argument("--particles", type=int, default=40,
+                        help="QPSO 粒子數量 M (default: 40)")
     parser.add_argument("--iterations", type=int, default=30,
                         help="QPSO 最大迭代次數 T (default: 30)")
-    parser.add_argument("--shots", type=int, default=512,
-                        help="每次量子取樣的 shots 數 (default: 512)")
+    parser.add_argument("--shots", type=int, default=4096,
+                        help="每次量子取樣的 shots 數 (default: 4096)")
     parser.add_argument("--alpha_max", type=float, default=1.0,
                         help="QPSO 收縮-擴張係數最大值 (default: 1.0)")
     parser.add_argument("--alpha_min", type=float, default=0.5,
                         help="QPSO 收縮-擴張係數最小值 (default: 0.5)")
-    
-    # 【已修正】這裡將 nvidia-mgq 加入白名單
+
+    # 【已修正】nvidia-mqpu 為 CUDA-Q 官方多 GPU 態向量模擬器後端名稱
     parser.add_argument("--backend", type=str, default="qpp-cpu",
-                        choices=["qpp-cpu", "nvidia", "tensornet", "nvidia-mgq"],
-                        help="CUDA-Q 模擬後端 (新增 nvidia-mgq 支援多 GPU 分散運算)")
-    
+                        choices=["qpp-cpu", "nvidia", "tensornet", "nvidia-mqpu"],
+                        help="CUDA-Q 模擬後端 (nvidia-mqpu 支援多 GPU 分散運算)")
+
     parser.add_argument("--seed", type=int, default=42,
                         help="隨機數種子 (default: 42)")
     parser.add_argument("--verbose_eval", action="store_true",
@@ -383,12 +362,12 @@ def main():
 
     args = parser.parse_args()
 
-    # 建立輸出目錄 (所有 Rank 都可以安全執行，exist_ok 保證不報錯)
+    # 建立輸出目錄
     os.makedirs(args.output_dir, exist_ok=True)
 
     print("╔" + "═" * 68 + "╗")
-    print("║  SQMG — 可擴展量子分子生成系統                                     ║")
-    print("║  Scalable Quantum Molecular Generation with CUDA-Q & QPSO         ║")
+    print("║  SQMG — 可擴展量子分子生成系統 (Single-Objective v6)               ║")
+    print("║  Scalable Quantum Molecular Generation with CUDA-Q & SOQPSO       ║")
     print("╚" + "═" * 68 + "╝")
     print(f"\n啟動時間: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"MPI Rank: {MPI_RANK} (Main Process: {IS_MAIN_PROCESS})")
@@ -399,16 +378,16 @@ def main():
     print(f"\n{'─' * 70}\nStep 1: 設定 CUDA-Q 模擬後端\n{'─' * 70}")
     configure_cudaq_backend(args.backend)
 
-    print(f"\n{'─' * 70}\nStep 2: 初始化 SQMG 3N+2 量子線路\n{'─' * 70}")
+    print(f"\n{'─' * 70}\nStep 2: 初始化 SQMG 3N+3 量子線路 (v5 Enhanced)\n{'─' * 70}")
     kernel = SQMGKernel(max_atoms=args.max_atoms, shots=args.shots)
     print(kernel.describe())
 
     print(f"\n{'─' * 70}\nStep 3: 初始化分子解碼器\n{'─' * 70}")
     decoder = MoleculeDecoder(max_atoms=args.max_atoms)
 
-    print(f"\n{'─' * 70}\nStep 4: 建立適應度函式\n{'─' * 70}")
-    pareto_archive = ParetoArchive(max_size=100, objectives=('validity', 'uniqueness'))
+    print(f"\n{'─' * 70}\nStep 4: 建立單目標適應度函式\n{'─' * 70}")
     fitness_fn = create_fitness_function(kernel, decoder, args.verbose_eval)
+    print("  Fitness = Validity × Uniqueness × Length_Penalty")
 
     print(f"\n{'─' * 70}\nStep 5: 初始化 MoleculeEvaluator & 迭代回呼\n{'─' * 70}")
     evaluator = MoleculeEvaluator()
@@ -418,13 +397,12 @@ def main():
         kernel, decoder, evaluator, extended_history, all_molecules
     )
 
-    print(f"\n{'─' * 70}\nStep 6: 初始化 MOQPSO 多目標量子粒子群優化器\n{'─' * 70}")
-    optimizer = MOQPSOOptimizer(
+    print(f"\n{'─' * 70}\nStep 6: 初始化 SOQPSO 單目標量子粒子群優化器\n{'─' * 70}")
+    optimizer = SOQPSOOptimizer(
         n_params=kernel.n_params,
         n_particles=args.particles,
         max_iterations=args.iterations,
         fitness_fn=fitness_fn,
-        archive=pareto_archive,
         alpha_max=args.alpha_max,
         alpha_min=args.alpha_min,
         seed=args.seed,
@@ -433,15 +411,15 @@ def main():
     )
 
     # ================================================================
-    # Step 7: 執行 MOQPSO 多目標優化
+    # Step 7: 執行 SOQPSO 單目標優化
     # ================================================================
-    print(f"\n{'─' * 70}\nStep 7: 執行 MOQPSO 多目標優化迭代\n{'─' * 70}")
+    print(f"\n{'─' * 70}\nStep 7: 執行 SOQPSO 單目標優化迭代\n{'─' * 70}")
     start_time = time.time()
-    best_params, best_obj, history = optimizer.optimize()
+    best_params, best_fitness, history = optimizer.optimize()
     elapsed = time.time() - start_time
 
     print(f"\n總耗時: {elapsed:.1f} 秒 ({elapsed / 60:.1f} 分鐘)")
-    print(f"  最優折中解: validity={best_obj[0]:.4f}, uniqueness={best_obj[1]:.4f}")
+    print(f"  最佳 Fitness: {best_fitness:.6f}")
 
     # ================================================================
     # Step 8: 分析最佳結果
@@ -467,7 +445,6 @@ def main():
 
         export_history_csv(extended_history, os.path.join(args.output_dir, "history_metrics.csv"))
         export_molecules_csv(all_molecules, os.path.join(args.output_dir, "generated_molecules.csv"))
-        export_archive_csv(pareto_archive, os.path.join(args.output_dir, "pareto_archive.csv"))
 
         try:
             plot_paths = plot_all(

@@ -3,15 +3,13 @@
 Plot Utils — SQMG 視覺化模組
 ==============================================================================
 
-提供四種圖表對應論文標準分析：
-  1. 多目標優化軌跡 (Convergence Trajectory)
+提供三種圖表對應論文標準分析（單目標 v6，已移除 Pareto 前緣圖）：
+  1. 收斂曲線 (Convergence Curve)
+     — Gbest Fitness 隨 Iteration 的變化
+  2. 優化軌跡 (Convergence Trajectory)
      — Validity×Uniqueness 與 Mean QED 隨 Iteration 的演進
-  2. Pareto 前緣散佈圖 (Pareto Frontier)
-     — QED vs. Validity 的 Pareto 最優解可視化
   3. 化學空間分佈 (Chemical Space Mapping)
      — Morgan Fingerprint → t-SNE / PCA 2D 降維散佈圖
-  4. 收斂曲線 (Convergence Curve)
-     — Gbest Fitness 隨 Iteration 的變化
 
 所有圖表自動存檔為 PNG，同時支援互動式 plt.show()。
 
@@ -373,7 +371,7 @@ def plot_all(
     dimred_method: str = "pca",
 ) -> List[str]:
     """
-    一次性生成所有 4 種圖表。
+    一次性生成所有 3 種圖表（單目標 v6，已移除 Pareto 前緣圖）。
 
     Args:
         history:       QPSO 歷史紀錄列表（含 validity, uniqueness 等指標）
@@ -392,7 +390,6 @@ def plot_all(
 
     paths.append(plot_convergence_curve(history, output_dir, show=show))
     paths.append(plot_convergence_trajectory(history, output_dir, show=show))
-    paths.append(plot_pareto_frontier(molecules, output_dir, show=show))
     paths.append(plot_chemical_space(molecules, output_dir,
                                      method=dimred_method, show=show))
 
