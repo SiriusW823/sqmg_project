@@ -132,20 +132,21 @@ def sqmg_circuit(thetas: list[float], n_atoms: int):
         x(q[prev_base])
         x(q[prev_base + 1])
         x(q[prev_base + 2])
-        x.ctrl(q[prev_base], q[prev_base + 1], q[prev_base + 2],
-               q[ancilla_idx])
+        # 【修正】CUDA-Q 傳入多個控制位元需使用 List
+        x.ctrl([q[prev_base], q[prev_base + 1], q[prev_base + 2]], q[ancilla_idx])
         x(q[ancilla_idx])
         x(q[prev_base])
         x(q[prev_base + 1])
         x(q[prev_base + 2])
         x.ctrl(q[ancilla_idx], q[bond_q0_idx])
+        
         # Uncompute ancilla
         x(q[prev_base])
         x(q[prev_base + 1])
         x(q[prev_base + 2])
         x(q[ancilla_idx])
-        x.ctrl(q[prev_base], q[prev_base + 1], q[prev_base + 2],
-               q[ancilla_idx])
+        # 【修正】CUDA-Q 傳入多個控制位元需使用 List
+        x.ctrl([q[prev_base], q[prev_base + 1], q[prev_base + 2]], q[ancilla_idx])
         x(q[prev_base])
         x(q[prev_base + 1])
         x(q[prev_base + 2])
@@ -160,20 +161,21 @@ def sqmg_circuit(thetas: list[float], n_atoms: int):
         x(q[curr_base])
         x(q[curr_base + 1])
         x(q[curr_base + 2])
-        x.ctrl(q[curr_base], q[curr_base + 1], q[curr_base + 2],
-               q[ancilla_idx])
+        # 【修正】CUDA-Q 傳入多個控制位元需使用 List
+        x.ctrl([q[curr_base], q[curr_base + 1], q[curr_base + 2]], q[ancilla_idx])
         x(q[ancilla_idx])
         x(q[curr_base])
         x(q[curr_base + 1])
         x(q[curr_base + 2])
         x.ctrl(q[ancilla_idx], q[bond_q1_idx])
+        
         # Uncompute ancilla
         x(q[curr_base])
         x(q[curr_base + 1])
         x(q[curr_base + 2])
         x(q[ancilla_idx])
-        x.ctrl(q[curr_base], q[curr_base + 1], q[curr_base + 2],
-               q[ancilla_idx])
+        # 【修正】CUDA-Q 傳入多個控制位元需使用 List
+        x.ctrl([q[curr_base], q[curr_base + 1], q[curr_base + 2]], q[ancilla_idx])
         x(q[curr_base])
         x(q[curr_base + 1])
         x(q[curr_base + 2])
