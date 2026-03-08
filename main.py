@@ -365,9 +365,12 @@ def main():
                         help="QPSO 收縮-擴張係數最大值 (default: 1.0)")
     parser.add_argument("--alpha_min", type=float, default=0.5,
                         help="QPSO 收縮-擴張係數最小值 (default: 0.5)")
+    
+    # 【已修正】這裡將 nvidia-mgq 加入白名單
     parser.add_argument("--backend", type=str, default="qpp-cpu",
                         choices=["qpp-cpu", "nvidia", "tensornet", "nvidia-mgq"],
                         help="CUDA-Q 模擬後端 (新增 nvidia-mgq 支援多 GPU 分散運算)")
+    
     parser.add_argument("--seed", type=int, default=42,
                         help="隨機數種子 (default: 42)")
     parser.add_argument("--verbose_eval", action="store_true",
