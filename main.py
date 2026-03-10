@@ -1,27 +1,17 @@
 """
 ==============================================================================
-SQMG Main Loop — 可擴展量子分子生成系統 主流程 (Single-Objective v6)
+SQMG Main Loop — MOQPSO + 完整鄰接矩陣版本
 ==============================================================================
+# MODIFIED: FIX-P0-1, FIX-P0-2, FIX-P1-1, FIX-QED, FIX-HYPER, FIX-CHEM, FIX-GPU
 
-本模組整合五大核心元件：
-  1. SQMGKernel        — CUDA-Q 3N+3 參數化量子線路 (v5 enhanced)
-  2. MoleculeDecoder   — Bit-string 到分子結構的解碼器
-  3. SOQPSOOptimizer   — 單目標量子粒子群優化器
-  4. MoleculeEvaluator — Validity / Uniqueness / Novelty 評估指標
-  5. plot_utils        — 視覺化模組（收斂軌跡、化學空間）
-
-策略：單目標重火力打擊 — 最大化 Fitness = Validity × Uniqueness × Length_Penalty
-
-執行方式：
-    python main.py [--max_atoms N] [--particles M] [--iterations T] [--shots S]
-
-CUDA-Q 後端設定：
-    • 'qpp-cpu'      — CPU 模擬（預設，不需 GPU）
-    • 'nvidia'       — GPU 態向量模擬（需要 NVIDIA GPU + CUDA）
-    • 'tensornet'    — GPU 張量網路模擬（大 N 時推薦）
-    • 'nvidia-mqpu'  — 多 GPU 分散式模擬 (需透過 mpirun 啟動)
+修改原因：
+  • 主流程已從單目標 SOQPSO 改為多目標 MOQPSO
+  • callback/CSV/圖表欄位需對齊新的 iter_record 結構
+  • CUDA-Q 後端改為支援 mqpu 的原生多 GPU 非同步取樣
 ==============================================================================
 """
+
+from __future__ import annotations
 
 import argparse
 import builtins
@@ -30,90 +20,74 @@ import os
 import sys
 import time
 from datetime import datetime
-from typing import Dict, List
+from typing import TYPE_CHECKING, Dict, List, Tuple
 
 import numpy as np
 
-# ============================================================================
-# MPI 多 GPU 環境設定 (避免輸出混亂與檔案寫入衝突)
-# ============================================================================
-def get_mpi_rank():
-    """獲取當前 MPI Process 的 Rank，若無 MPI 則回傳 0"""
+
+def get_mpi_rank() -> int:
     for env_var in ['OMPI_COMM_WORLD_RANK', 'PMI_RANK', 'MV2_COMM_WORLD_RANK']:
         if env_var in os.environ:
             return int(os.environ[env_var])
     return 0
 
-MPI_RANK = get_mpi_rank()
-IS_MAIN_PROCESS = (MPI_RANK == 0)
 
-# 覆寫內建 print，只允許 Rank 0 輸出，保持終端機乾淨
+MPI_RANK = get_mpi_rank()
+IS_MAIN_PROCESS = MPI_RANK == 0
+
 _original_print = builtins.print
+
+
 def rank0_print(*args, **kwargs):
     if IS_MAIN_PROCESS:
         _original_print(*args, **kwargs)
+
+
 builtins.print = rank0_print
 
 
-# ── CUDA-Q Import ──
 try:
     import cudaq
 except ImportError:
-    print("=" * 70)
-    print("錯誤：無法匯入 CUDA-Q (cudaq)。")
-    print("請先安裝 CUDA-Q：")
-    print("  pip install cuda-quantum-cu12")
-    print("=" * 70)
-    sys.exit(1)
+    cudaq = None
 
-# ── RDKit Import ──
 try:
-    from rdkit import Chem
     from rdkit import RDLogger
-    # 抑制 RDKit 的冗長警告訊息
+
     RDLogger.logger().setLevel(RDLogger.ERROR)
 except ImportError:
-    print("=" * 70)
-    print("錯誤：無法匯入 RDKit。")
-    print("請先安裝 RDKit：")
-    print("  pip install rdkit")
-    print("⚠ 並確保 numpy < 2.0：pip install 'numpy>=1.24,<2.0'")
-    print("=" * 70)
-    sys.exit(1)
+    RDLogger = None
 
-# ── 本地模組 Import ──
-from sqmg_kernel import SQMGKernel
-from molecule_decoder import MoleculeDecoder
-from quantum_optimizer import SOQPSOOptimizer
-from evaluator import MoleculeEvaluator
-from plot_utils import plot_all
+if TYPE_CHECKING:
+    from evaluator import MoleculeEvaluator
+    from molecule_decoder import MoleculeDecoder
+    from sqmg_kernel import SQMGKernel
 
 
-# ============================================================================
-# CUDA-Q 後端組態
-# ============================================================================
-
-def configure_cudaq_backend(target: str = "qpp-cpu"):
-    """
-    設定 CUDA-Q 模擬後端。
-    """
+# 修改原因：以 CUDA-Q 官方 mqpu 介面初始化多 GPU，而非使用已棄用 target 名稱。
+def configure_cudaq_backend(target: str = 'nvidia-mqpu'):
+    if cudaq is None:
+        raise RuntimeError('無法匯入 CUDA-Q (cudaq)，請先安裝後再執行主流程。')
     try:
-        cudaq.set_target(target)
-        print(f"[CUDA-Q] 後端已設定為: {target}")
-    except Exception as e:
-        print(f"[CUDA-Q] 警告：無法設定後端 '{target}'，使用預設後端。")
-        print(f"        錯誤訊息: {e}")
-        try:
-            cudaq.set_target("qpp-cpu")
-            print("[CUDA-Q] 已降級為 qpp-cpu 後端。")
-        except Exception:
-            print("[CUDA-Q] 使用系統預設後端。")
+        # [FIX-BACKEND] tensornet 後端需要使用 tensornet 字串
+        if target == 'tensornet':
+            cudaq.set_target('tensornet')
+        elif target == 'nvidia':
+            # [FIX-BACKEND] 暫時設定為 nvidia，Step 1 結束後會由 FIX-GPU 升級為 mqpu
+            cudaq.set_target('nvidia')
+        elif target == 'nvidia-mqpu':
+            cudaq.set_target('nvidia')
+        else:
+            cudaq.set_target(target)
+        print(f'[CUDA-Q] 後端已設定為: {target}')
+    except Exception as exc:
+        print(f"[CUDA-Q] 警告：無法設定後端 '{target}'，改用 qpp-cpu。")
+        print(f'        錯誤訊息: {exc}')
+        cudaq.set_target('qpp-cpu')
+        print('[CUDA-Q] 已降級為 qpp-cpu 後端。')
 
 
-# ============================================================================
-# 適應度函式 (Fitness Function) — 單目標標量回傳
-# ============================================================================
-
+# 修改原因：fitness_fn 改為回傳 (validity, uniqueness, valid_smiles)，供 archive 正確保存分子資訊。
 def create_fitness_function(
     kernel: SQMGKernel,
     decoder: MoleculeDecoder,
@@ -121,37 +95,45 @@ def create_fitness_function(
 ):
     eval_count = [0]
 
-    def fitness_fn(params: np.ndarray) -> float:
+    # [FIX-P0-2] fitness_fn 改為回傳三個值：(validity, uniqueness, valid_smiles_list)
+    def fitness_fn(params: np.ndarray) -> Tuple[float, float, List[str]]:
+        """
+        三目標回傳的適應度評估函式。
+
+        流程：
+        1. params → CUDA-Q kernel (cudaq.sample)
+        2. bit-strings → MoleculeDecoder
+        3. 分子 → RDKit → (validity, uniqueness, valid_smiles)
+        """
         eval_count[0] += 1
         try:
             counts = kernel.sample(params)
-            fitness, decoded = decoder.compute_fitness(counts)
+            (validity, uniqueness), decoded = decoder.compute_fitness(counts)
+            # [FIX-P0-2] 提取有效 SMILES 列表，供 archive.try_add() 使用
+            valid_smiles = [
+                r['smiles'] for r in decoded
+                if r.get('valid') and r.get('smiles') and not r.get('partial_valid')
+            ]
 
             if verbose_eval:
-                valid_count = sum(
-                    1 for r in decoded
-                    if r.get('valid') and not r.get('partial_valid')
-                )
+                valid_count = len(valid_smiles)
                 print(
                     f"    [Eval #{eval_count[0]}] "
                     f"BS={len(decoded)} "
                     f"Valid={valid_count} "
-                    f"fitness={fitness:.6f}"
+                    f"val={validity:.4f} "
+                    f"uniq={uniqueness:.4f}"
                 )
-            return fitness
-
+            return (validity, uniqueness, valid_smiles)
         except Exception as e:
             if verbose_eval:
                 print(f"    [Eval #{eval_count[0]}] 錯誤: {e}")
-            return 0.0
+            return 0.0, 0.0, []
 
     return fitness_fn
 
 
-# ============================================================================
-# 迭代回呼
-# ============================================================================
-
+# 修改原因：callback 全面對齊 MOQPSO iter_record 的實際 key，避免 KeyError 導致歷史記錄全歸零。
 def create_iteration_callback(
     kernel: SQMGKernel,
     decoder: MoleculeDecoder,
@@ -159,55 +141,55 @@ def create_iteration_callback(
     extended_history: List[Dict],
     all_molecules: List[Dict],
 ):
-    _seen_smiles: set = set()
-    for m in all_molecules:
-        _seen_smiles.add(m['smiles'])
+    seen_smiles = {molecule['smiles'] for molecule in all_molecules if molecule.get('smiles')}
 
     def callback(iteration: int, record: dict):
+        # [FIX-P0-1] 修正 key 名稱：gbest_params → best_compromise_params
+        gbest_params = record.get('best_compromise_params')
         validity = 0.0
         uniqueness = 0.0
         novelty = 0.0
-        mean_qed = 0.0
+        # [FIX-QED] 已移除 QED
 
-        gbest_params = record.get('gbest_params')
         if gbest_params is None:
-            print(f"  [Callback Iter {iteration + 1}] 警告：gbest_params 為 None")
+            # [FIX-P0-1] 更新警告訊息以符合新 key 名稱
+            print(f"  [Callback Iter {iteration + 1}] 警告：best_compromise_params 為 None，Archive 可能為空")
         else:
             try:
-                counts = kernel.sample(gbest_params)
+                counts = kernel.sample(np.asarray(gbest_params, dtype=np.float64))
                 decoded = decoder.decode_counts(counts)
                 metrics = evaluator.evaluate(decoded)
-
                 validity = metrics['validity']
                 uniqueness = metrics['uniqueness']
-                novelty = metrics['novelty']
-                mean_qed = metrics['mean_qed']
+                novelty = float(metrics.get('novelty', 0.0))
+                # [FIX-QED] 已移除 QED
 
-                for r in decoded:
-                    if r.get('valid') and not r.get('partial_valid'):
-                        smi = r.get('smiles')
-                        if smi and smi not in _seen_smiles:
+                for molecule in decoded:
+                    if molecule.get('valid') and molecule.get('smiles') and not molecule.get('partial_valid'):
+                        smiles = molecule['smiles']
+                        if smiles not in seen_smiles:
                             all_molecules.append({
-                                'smiles': smi,
-                                'qed': r['qed'],
-                                'mol': r.get('mol'),
+                                'smiles': smiles,
+                                'qed': molecule.get('qed', 0.0),
+                                'mol': molecule.get('mol'),
                             })
-                            _seen_smiles.add(smi)
-            except Exception as e:
-                print(f"  [Callback Iter {iteration + 1}] 評估失敗: {e}")
+                            seen_smiles.add(smiles)
+            except Exception as exc:
+                print(f'  [Callback Iter {iteration + 1}] 評估失敗: {exc}')
 
+        # [FIX-P0-1] 修正所有 key 名稱以符合 MOQPSOOptimizer.iter_record 的實際結構
         ext_record = {
             'iteration': record['iteration'],
-            'gbest_fitness': record['gbest_fitness'],
-            'mean_fitness': record.get('mean_fitness', 0),
-            'max_fitness': record.get('max_fitness', 0),
-            'min_fitness': record.get('min_fitness', 0),
-            'alpha': record.get('alpha', 0),
+            'gbest_fitness': record.get('best_validity', 0.0) + record.get('best_uniqueness', 0.0),
+            'mean_fitness': record.get('mean_validity', 0.0),
+            'max_fitness': record.get('max_validity', 0.0),
+            'min_fitness': 0.0,
+            'alpha': record.get('alpha', 0.0),
             'validity': validity,
             'uniqueness': uniqueness,
             'novelty': novelty,
-            'mean_qed': mean_qed,
-            'diversity': record.get('diversity', 0),
+            # [FIX-QED] 已移除 QED
+            'diversity': record.get('diversity', 0.0),
             'stagnation_counter': record.get('stagnation_counter', 0),
             'n_mutated': record.get('n_mutated', 0),
         }
@@ -216,61 +198,80 @@ def create_iteration_callback(
     return callback
 
 
-# ============================================================================
-# CSV 匯出
-# ============================================================================
-
 def export_history_csv(history: List[Dict], filepath: str):
     if not history:
         return
+
+    # [FIX-QED] 移除 Mean_QED 欄位，QED 不是優化目標
     fieldnames = [
         'Iteration', 'Gbest_Fitness', 'Mean_Fitness', 'Alpha',
-        'Validity', 'Uniqueness', 'Novelty', 'Mean_QED',
+        'Validity', 'Uniqueness', 'Novelty',
         'Diversity', 'Stagnation', 'N_Mutated',
     ]
-    with open(filepath, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+    with open(filepath, 'w', newline='', encoding='utf-8') as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
-        for h in history:
+        for record in history:
             writer.writerow({
-                'Iteration': h['iteration'] + 1,
-                'Gbest_Fitness': f"{h['gbest_fitness']:.6f}",
-                'Mean_Fitness': f"{h.get('mean_fitness', 0):.6f}",
-                'Alpha': f"{h.get('alpha', 0):.4f}",
-                'Validity': f"{h.get('validity', 0):.4f}",
-                'Uniqueness': f"{h.get('uniqueness', 0):.4f}",
-                'Novelty': f"{h.get('novelty', 0):.4f}",
-                'Mean_QED': f"{h.get('mean_qed', 0):.6f}",
-                'Diversity': f"{h.get('diversity', 0):.4f}",
-                'Stagnation': h.get('stagnation_counter', 0),
-                'N_Mutated': h.get('n_mutated', 0),
+                'Iteration': int(record.get('iteration', 0)) + 1,
+                'Gbest_Fitness': f"{record.get('gbest_fitness', 0.0):.6f}",
+                'Mean_Fitness': f"{record.get('mean_fitness', 0.0):.6f}",
+                'Alpha': f"{record.get('alpha', 0.0):.4f}",
+                'Validity': f"{record.get('validity', 0.0):.4f}",
+                'Uniqueness': f"{record.get('uniqueness', 0.0):.4f}",
+                'Novelty': f"{record.get('novelty', 0.0):.4f}",
+                # [FIX-QED] 已移除 已移除 的注釋
+                'Diversity': f"{record.get('diversity', 0.0):.4f}",
+                'Stagnation': int(record.get('stagnation_counter', 0)),
+                'N_Mutated': int(record.get('n_mutated', 0)),
             })
-    print(f"  歷史指標已匯出至: {filepath}")
+    print(f'  歷史指標已匯出至: {filepath}')
+
+
+# 修改原因：Pareto Archive 匯出需保留 Top_SMILES，避免空白欄位。
+def export_archive_csv(archive_entries: List[Dict], filepath: str):
+    if not archive_entries:
+        return
+
+    fieldnames = ['Rank', 'Validity', 'Uniqueness', 'Compromise', 'Top_SMILES', 'Num_SMILES']
+    with open(filepath, 'w', newline='', encoding='utf-8') as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for rank, entry in enumerate(archive_entries, start=1):
+            smiles_list = entry.get('smiles', []) or []
+            writer.writerow({
+                'Rank': rank,
+                'Validity': f"{entry.get('objectives', {}).get('validity', 0.0):.6f}",
+                'Uniqueness': f"{entry.get('objectives', {}).get('uniqueness', 0.0):.6f}",
+                'Compromise': f"{entry.get('objectives', {}).get('validity', 0.0) * entry.get('objectives', {}).get('uniqueness', 0.0):.6f}",
+                'Top_SMILES': ' | '.join(smiles_list[:5]),
+                'Num_SMILES': len(smiles_list),
+            })
+    print(f'  Pareto Archive 已匯出至: {filepath}')
+
 
 def export_molecules_csv(molecules: List[Dict], filepath: str):
     if not molecules:
         return
-    fieldnames = ['SMILES', 'QED']
-    with open(filepath, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+    with open(filepath, 'w', newline='', encoding='utf-8') as handle:
+        writer = csv.DictWriter(handle, fieldnames=['SMILES', 'QED'])
         writer.writeheader()
-        sorted_mols = sorted(molecules, key=lambda m: -m.get('qed', 0))
-        for m in sorted_mols:
+        for molecule in sorted(molecules, key=lambda item: -item.get('qed', 0.0)):
             writer.writerow({
-                'SMILES': m['smiles'],
-                'QED': f"{m.get('qed', 0):.6f}",
+                'SMILES': molecule.get('smiles', ''),
+                'QED': f"{molecule.get('qed', 0.0):.6f}",
             })
-    print(f"  分子列表已匯出至: {filepath}")
+    print(f'  分子列表已匯出至: {filepath}')
 
-
-# ============================================================================
-# 結果分析與輸出
-# ============================================================================
 
 def analyze_best_result(best_params: np.ndarray, kernel: SQMGKernel, decoder: MoleculeDecoder):
-    print("\n" + "=" * 70)
-    print("最終結果分析")
-    print("=" * 70)
+    if best_params is None or len(best_params) != kernel.n_params:
+        print('\n⚠ 無可分析的最佳參數。')
+        return []
+
+    print('\n' + '=' * 70)
+    print('最終結果分析')
+    print('=' * 70)
 
     original_shots = kernel.shots
     kernel.shots = max(original_shots * 4, 4096)
@@ -278,173 +279,179 @@ def analyze_best_result(best_params: np.ndarray, kernel: SQMGKernel, decoder: Mo
     decoded = decoder.decode_counts(counts)
     kernel.shots = original_shots
 
-    total_unique = len(decoded)
-    valid_results = [r for r in decoded if r['valid']]
-    n_valid = len(valid_results)
-
-    print(f"\n解碼統計（{kernel.shots * 4} shots 取樣）：")
-    print(f"  不同 bit-string 數 : {total_unique}")
-    print(f"  有效分子數         : {n_valid}")
-    if total_unique > 0:
-        print(f"  有效性比率 (Validity): {100 * n_valid / total_unique:.1f}%")
+    valid_results = [item for item in decoded if item.get('valid') and not item.get('partial_valid')]
+    print(f'\n不同 bit-string 數 : {len(decoded)}')
+    print(f'有效分子數         : {len(valid_results)}')
 
     if valid_results:
-        qeds = [r['qed'] for r in valid_results]
-        print(f"  平均 QED           : {np.mean(qeds):.4f}")
-        print(f"  最高 QED           : {np.max(qeds):.4f}")
-
-        print(f"\n所有有效分子（按 QED 降序）：")
-        print(f"{'排名':>4}  {'SMILES':30s}  {'QED':>8}  {'計數':>6}  {'原子碼':20s}  {'鍵碼':15s}")
-        print("-" * 90)
-
-        sorted_valid = sorted(valid_results, key=lambda r: -r['qed'])
-        for rank, r in enumerate(sorted_valid, 1):
-            atom_str = " ".join(r['atom_codes'])
-            bond_str = " ".join(r['bond_codes'])
+        qeds = [item.get('qed', 0.0) for item in valid_results]
+        print(f'平均 QED           : {np.mean(qeds):.4f}')
+        print(f'最高 QED           : {np.max(qeds):.4f}')
+        print('\n所有有效分子（按 QED 降序）：')
+        for rank, item in enumerate(sorted(valid_results, key=lambda row: -row.get('qed', 0.0)), start=1):
             print(
-                f"{rank:4d}  {r['smiles']:30s}  "
-                f"{r['qed']:8.4f}  {r['count']:6d}  "
-                f"{atom_str:20s}  {bond_str:15s}"
+                f"{rank:4d}  {item.get('smiles', ''):30s}  "
+                f"QED={item.get('qed', 0.0):.4f}  count={item.get('count', 0)}"
             )
-
-        best_mol_record = sorted_valid[0]
-        print(f"\n★ 最佳分子：")
-        print(f"  SMILES   : {best_mol_record['smiles']}")
-        print(f"  QED      : {best_mol_record['qed']:.6f}")
-        print(f"  Bit-string: {best_mol_record['bitstring']}")
-        print(f"  原子碼   : {best_mol_record['atom_codes']}")
-        print(f"  鍵碼     : {best_mol_record['bond_codes']}")
     else:
-        print("\n⚠ 未找到有效分子。")
+        print('\n⚠ 未找到有效分子。')
 
-    print(f"\n最佳參數向量（可用於重現結果）：")
-    print(f"  np.array({best_params.tolist()})")
-
+    print('\n最佳參數向量：')
+    print(f'  np.array({best_params.tolist()})')
     return valid_results
 
 
-# ============================================================================
-# 主流程 (Main Loop)
-# ============================================================================
+def build_param_metadata(kernel: SQMGKernel) -> Tuple[List[int], List[Tuple[int, str]]]:
+    atom_param_indices = kernel.get_atom_param_indices()
+    bond_param_indices = kernel.get_bond_param_indices()
+    return atom_param_indices, bond_param_indices
+
 
 def main():
+    if cudaq is None:
+        print('=' * 70)
+        print('錯誤：無法匯入 CUDA-Q (cudaq)。')
+        print('請先安裝 CUDA-Q。')
+        print('=' * 70)
+        sys.exit(1)
+    if RDLogger is None:
+        print('=' * 70)
+        print('錯誤：無法匯入 RDKit。')
+        print('=' * 70)
+        sys.exit(1)
+
+    from evaluator import MoleculeEvaluator
+    from molecule_decoder import MoleculeDecoder
+    from plot_utils import plot_all
+    from quantum_optimizer import MOQPSOOptimizer
+    from sqmg_kernel import SQMGKernel
+
     parser = argparse.ArgumentParser(
-        description="SQMG — 可擴展量子分子生成系統 (Single-Objective v6)",
+        description='SQMG — Scalable Quantum Molecular Generation with MOQPSO',
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--max_atoms", type=int, default=4,
-                        help="最大重原子數量 N (default: 4)")
-    parser.add_argument("--particles", type=int, default=40,
-                        help="QPSO 粒子數量 M (default: 40)")
-    parser.add_argument("--iterations", type=int, default=30,
-                        help="QPSO 最大迭代次數 T (default: 30)")
-    parser.add_argument("--shots", type=int, default=4096,
-                        help="每次量子取樣的 shots 數 (default: 4096)")
-    parser.add_argument("--alpha_max", type=float, default=1.0,
-                        help="QPSO 收縮-擴張係數最大值 (default: 1.0)")
-    parser.add_argument("--alpha_min", type=float, default=0.5,
-                        help="QPSO 收縮-擴張係數最小值 (default: 0.5)")
-
-    # 【已修正】nvidia-mqpu 為 CUDA-Q 官方多 GPU 態向量模擬器後端名稱
-    parser.add_argument("--backend", type=str, default="qpp-cpu",
-                        choices=["qpp-cpu", "nvidia", "tensornet", "nvidia-mqpu"],
-                        help="CUDA-Q 模擬後端 (nvidia-mqpu 支援多 GPU 分散運算)")
-
-    parser.add_argument("--seed", type=int, default=42,
-                        help="隨機數種子 (default: 42)")
-    parser.add_argument("--verbose_eval", action="store_true",
-                        help="每次適應度評估都印出詳細資訊")
-    parser.add_argument("--output_dir", type=str, default="./output",
-                        help="結果輸出目錄 (default: ./output)")
-    parser.add_argument("--dimred", type=str, default="pca",
-                        choices=["pca", "tsne"],
-                        help="化學空間降維方法 (default: pca)")
-
+    parser.add_argument('--max_atoms', type=int, default=4, help='最大重原子數量 N (default: 4)')
+    # [FIX-HYPER] default=30
+    parser.add_argument('--particles', type=int, default=30, help='MOQPSO 粒子數量 M (default: 30)')
+    # [FIX-HYPER] default=150
+    parser.add_argument('--iterations', type=int, default=150, help='MOQPSO 最大迭代次數 T (default: 150)')
+    # [FIX-HYPER] default=1024
+    parser.add_argument('--shots', type=int, default=1024, help='每次量子取樣的 shots 數 (default: 1024)')
+    parser.add_argument('--alpha_max', type=float, default=1.2, help='MOQPSO α 最大值 (default: 1.2)')
+    parser.add_argument('--alpha_min', type=float, default=0.4, help='MOQPSO α 最小值 (default: 0.4)')
+    parser.add_argument(
+        '--backend',
+        type=str,
+        default='nvidia-mqpu',
+        choices=['qpp-cpu', 'nvidia', 'tensornet', 'nvidia-mqpu'],
+        help='CUDA-Q 模擬後端 (default: nvidia-mqpu)',
+    )
+    parser.add_argument('--seed', type=int, default=42, help='隨機數種子 (default: 42)')
+    parser.add_argument('--verbose_eval', action='store_true', help='輸出每次適應度評估資訊')
+    parser.add_argument('--output_dir', type=str, default='./output', help='結果輸出目錄')
+    parser.add_argument('--dimred', type=str, default='pca', choices=['pca', 'tsne'], help='化學空間降維方法')
     args = parser.parse_args()
 
-    # 建立輸出目錄
     os.makedirs(args.output_dir, exist_ok=True)
 
-    print("╔" + "═" * 68 + "╗")
-    print("║  SQMG — 可擴展量子分子生成系統 (Single-Objective v6)               ║")
-    print("║  Scalable Quantum Molecular Generation with CUDA-Q & SOQPSO       ║")
-    print("╚" + "═" * 68 + "╝")
+    print('╔' + '═' * 68 + '╗')
+    print('║  SQMG — 可擴展量子分子生成系統 (MOQPSO + CUDA-Q mqpu)            ║')
+    print('╚' + '═' * 68 + '╝')
     print(f"\n啟動時間: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"MPI Rank: {MPI_RANK} (Main Process: {IS_MAIN_PROCESS})")
+    print(f'MPI Rank: {MPI_RANK} (Main Process: {IS_MAIN_PROCESS})')
 
-    # ================================================================
-    # Step 1~6: 初始化元件
-    # ================================================================
     print(f"\n{'─' * 70}\nStep 1: 設定 CUDA-Q 模擬後端\n{'─' * 70}")
     configure_cudaq_backend(args.backend)
+    # [FIX-GPU] 若後端為 nvidia，嘗試啟用多 QPU 模式以利用 8× V100
+    if args.backend in {'nvidia', 'nvidia-mqpu'}:
+        try:
+            import os
+            os.environ.setdefault('CUDAQ_MQPU_NGPUS', '8')
+            cudaq.set_target("nvidia", option="mqpu")
+            n_gpus = cudaq.num_available_gpus() if hasattr(cudaq, 'num_available_gpus') else 1
+            print(f"[CUDA-Q] 多 QPU 模式已啟用，偵測到 {n_gpus} 個 GPU")
+        except Exception as mqpu_err:
+            print(f"[CUDA-Q] 多 QPU 模式啟用失敗（{mqpu_err}），維持單 GPU 模式")
 
-    print(f"\n{'─' * 70}\nStep 2: 初始化 SQMG 3N+3 量子線路 (v5 Enhanced)\n{'─' * 70}")
+    print(f"\n{'─' * 70}\nStep 2: 初始化完整鄰接矩陣 SQMG 量子線路\n{'─' * 70}")
     kernel = SQMGKernel(max_atoms=args.max_atoms, shots=args.shots)
     print(kernel.describe())
 
     print(f"\n{'─' * 70}\nStep 3: 初始化分子解碼器\n{'─' * 70}")
     decoder = MoleculeDecoder(max_atoms=args.max_atoms)
 
-    print(f"\n{'─' * 70}\nStep 4: 建立單目標適應度函式\n{'─' * 70}")
+    print(f"\n{'─' * 70}\nStep 4: 建立多目標適應度函式\n{'─' * 70}")
     fitness_fn = create_fitness_function(kernel, decoder, args.verbose_eval)
-    print("  Fitness = Validity × Uniqueness × Length_Penalty")
+    print('  Objectives = (Validity, Uniqueness)')
 
-    print(f"\n{'─' * 70}\nStep 5: 初始化 MoleculeEvaluator & 迭代回呼\n{'─' * 70}")
+    print(f"\n{'─' * 70}\nStep 5: 初始化評估器與迭代回呼\n{'─' * 70}")
     evaluator = MoleculeEvaluator()
     extended_history: List[Dict] = []
     all_molecules: List[Dict] = []
-    iteration_callback = create_iteration_callback(
-        kernel, decoder, evaluator, extended_history, all_molecules
-    )
+    iteration_callback = create_iteration_callback(kernel, decoder, evaluator, extended_history, all_molecules)
 
-    print(f"\n{'─' * 70}\nStep 6: 初始化 SOQPSO 單目標量子粒子群優化器\n{'─' * 70}")
-    optimizer = SOQPSOOptimizer(
+    print(f"\n{'─' * 70}\nStep 6: 初始化 MOQPSO 優化器\n{'─' * 70}")
+    # [FIX-CHEM] 建立 Chemistry Constraints 的 bond 參數索引
+    # 參數佈局：前 3N 個為 atom 參數，後 N*(N-1) 個為 bond 參數
+    # 每組 bond pair 佔 2 個參數：
+    #   偏移 0 → 'single_double' 類型，對應 Single/Double 鍵切換，限制在 [0, π]
+    #   偏移 1 → 'double_triple' 類型，對應 Double/Triple 鍵切換，限制在 [0, π/2]
+    n_atom_params = 3 * args.max_atoms
+    n_bond_pairs = args.max_atoms - 1
+    bond_param_indices = []
+    for bp_idx in range(n_bond_pairs):
+        base = n_atom_params + 2 * bp_idx
+        bond_param_indices.append((base, 'single_double'))
+        bond_param_indices.append((base + 1, 'double_triple'))
+
+    optimizer = MOQPSOOptimizer(
         n_params=kernel.n_params,
         n_particles=args.particles,
         max_iterations=args.iterations,
         fitness_fn=fitness_fn,
+        kernel=kernel,
+        decoder=decoder,
+        shots=args.shots,
         alpha_max=args.alpha_max,
         alpha_min=args.alpha_min,
         seed=args.seed,
         verbose=True,
         iteration_callback=iteration_callback,
+        # [FIX-CHEM] 傳入 Chemistry Constraints 參數
+        bond_param_indices=bond_param_indices,
+        use_chem_constraints=True,
+        use_async_sampling=True,
     )
 
-    # ================================================================
-    # Step 7: 執行 SOQPSO 單目標優化
-    # ================================================================
-    print(f"\n{'─' * 70}\nStep 7: 執行 SOQPSO 單目標優化迭代\n{'─' * 70}")
+    print(f"\n{'─' * 70}\nStep 7: 執行 MOQPSO 優化\n{'─' * 70}")
     start_time = time.time()
-    best_params, best_fitness, history = optimizer.optimize()
+    best_params, best_objectives, _history = optimizer.optimize()
     elapsed = time.time() - start_time
+    best_score = best_objectives.get('validity', 0.0) * best_objectives.get('uniqueness', 0.0)
 
     print(f"\n總耗時: {elapsed:.1f} 秒 ({elapsed / 60:.1f} 分鐘)")
-    print(f"  最佳 Fitness: {best_fitness:.6f}")
+    print(f"  最佳 validity     : {best_objectives.get('validity', 0.0):.6f}")
+    print(f"  最佳 uniqueness   : {best_objectives.get('uniqueness', 0.0):.6f}")
+    print(f'  validity × uniqueness: {best_score:.6f}')
 
-    # ================================================================
-    # Step 8: 分析最佳結果
-    # ================================================================
     print(f"\n{'─' * 70}\nStep 8: 分析最佳結果\n{'─' * 70}")
     valid_results = analyze_best_result(best_params, kernel, decoder)
+    existing_smiles = {molecule['smiles'] for molecule in all_molecules if molecule.get('smiles')}
+    for item in valid_results:
+        smiles = item.get('smiles')
+        if smiles and smiles not in existing_smiles:
+            all_molecules.append({
+                'smiles': smiles,
+                'qed': item.get('qed', 0.0),
+                'mol': item.get('mol'),
+            })
+            existing_smiles.add(smiles)
 
-    if valid_results:
-        existing_smiles = {m['smiles'] for m in all_molecules}
-        for r in valid_results:
-            smi = r.get('smiles')
-            if smi and not r.get('partial_valid') and smi not in existing_smiles:
-                all_molecules.append({
-                    'smiles': smi, 'qed': r['qed'], 'mol': r.get('mol'),
-                })
-                existing_smiles.add(smi)
-
-    # ================================================================
-    # Step 9: CSV 匯出 & 視覺化 (僅限主程序執行)
-    # ================================================================
     if IS_MAIN_PROCESS:
-        print(f"\n{'─' * 70}\nStep 9: CSV 匯出 & 視覺化\n{'─' * 70}")
-
-        export_history_csv(extended_history, os.path.join(args.output_dir, "history_metrics.csv"))
-        export_molecules_csv(all_molecules, os.path.join(args.output_dir, "generated_molecules.csv"))
+        print(f"\n{'─' * 70}\nStep 9: 匯出結果與視覺化\n{'─' * 70}")
+        export_history_csv(extended_history, os.path.join(args.output_dir, 'history_metrics.csv'))
+        export_archive_csv(optimizer.archive.as_sorted_list(), os.path.join(args.output_dir, 'pareto_archive.csv'))
+        export_molecules_csv(all_molecules, os.path.join(args.output_dir, 'generated_molecules.csv'))
 
         try:
             plot_paths = plot_all(
@@ -454,14 +461,15 @@ def main():
                 show=False,
                 dimred_method=args.dimred,
             )
-            print(f"\n  已生成 {len(plot_paths)} 張圖表。")
-        except Exception as e:
-            print(f"\n  [視覺化警告] 圖表生成失敗: {e}")
+            print(f'\n  已生成 {len(plot_paths)} 張圖表。')
+        except Exception as exc:
+            print(f'\n  [視覺化警告] 圖表生成失敗: {exc}')
 
         print(f"\n{'═' * 70}")
-        print("SQMG 執行完成。所有結果已輸出至:")
+        print('SQMG 執行完成。所有結果已輸出至:')
         print(f"  {os.path.abspath(args.output_dir)}")
         print(f"{'═' * 70}")
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     main()

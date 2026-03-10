@@ -2,6 +2,7 @@
 ==============================================================================
 Plot Utils — SQMG 視覺化模組
 ==============================================================================
+# MODIFIED: FIX-P0-1, FIX-P0-2, FIX-P1-1, FIX-QED, FIX-HYPER, FIX-CHEM, FIX-GPU
 
 提供三種圖表對應論文標準分析（單目標 v6，已移除 Pareto 前緣圖）：
   1. 收斂曲線 (Convergence Curve)
@@ -40,58 +41,39 @@ def plot_convergence_trajectory(
     show: bool = False,
 ) -> str:
     """
-    繪製多目標優化軌跡：Validity×Uniqueness 與 Mean QED 隨 Iteration 的演進。
+    繪製 Validity & Uniqueness 收斂軌跡。
 
-    對應論文中的 Figure: Multi-objective optimization trajectory。
-
-    Args:
-        history:    QPSO 歷史紀錄列表（每個元素須包含
-                    'iteration', 'validity', 'uniqueness', 'mean_qed'）
-        output_dir: 圖表輸出目錄
-        filename:   輸出檔名
-        show:       是否呼叫 plt.show()
-
-    Returns:
-        圖片儲存路徑
+    [FIX-QED] 移除 QED 右軸，專注於兩個優化目標：
+    - Validity × Uniqueness（主指標）
+    - Validity（單獨追蹤）
+    - Novelty（輔助參考，不參與優化）
     """
     iters = [h['iteration'] + 1 for h in history]
-
-    # Validity × Uniqueness（組合品質指標）
     val_uniq = [h.get('validity', 0) * h.get('uniqueness', 0) for h in history]
-    mean_qeds = [h.get('mean_qed', 0) for h in history]
     validities = [h.get('validity', 0) for h in history]
+    uniquenesses = [h.get('uniqueness', 0) for h in history]
     novelties = [h.get('novelty', 0) for h in history]
 
-    fig, ax1 = plt.subplots(figsize=(12, 6))
+    fig, ax = plt.subplots(figsize=(12, 6))
 
-    # 左 Y 軸：Validity × Uniqueness
-    color1 = '#2196F3'
-    ax1.set_xlabel('Iteration', fontsize=13)
-    ax1.set_ylabel('Validity × Uniqueness', color=color1, fontsize=13)
-    line1 = ax1.plot(iters, val_uniq, color=color1, linewidth=2.5,
-                     marker='o', markersize=4, label='Validity × Uniqueness')
-    line2 = ax1.plot(iters, validities, color='#64B5F6', linewidth=1.5,
-                     linestyle='--', alpha=0.7, label='Validity')
-    ax1.tick_params(axis='y', labelcolor=color1)
-    ax1.set_ylim(-0.05, 1.1)
+    ax.set_xlabel('Iteration', fontsize=13)
+    ax.set_ylabel('Score', fontsize=13)
 
-    # 右 Y 軸：Mean QED
-    ax2 = ax1.twinx()
-    color2 = '#FF5722'
-    ax2.set_ylabel('Mean QED', color=color2, fontsize=13)
-    line3 = ax2.plot(iters, mean_qeds, color=color2, linewidth=2.5,
-                     marker='s', markersize=4, label='Mean QED')
-    line4 = ax2.plot(iters, novelties, color='#FF8A65', linewidth=1.5,
-                     linestyle=':', alpha=0.7, label='Novelty')
-    ax2.tick_params(axis='y', labelcolor=color2)
-    ax2.set_ylim(-0.05, 1.1)
+    ax.plot(iters, val_uniq, color='#1565C0', linewidth=2.5,
+        marker='o', markersize=4, label='Validity × Uniqueness (目標)')
+    ax.plot(iters, validities, color='#42A5F5', linewidth=1.8,
+        linestyle='--', alpha=0.85, label='Validity')
+    ax.plot(iters, uniquenesses, color='#26A69A', linewidth=1.8,
+        linestyle='-.', alpha=0.85, label='Uniqueness')
+    ax.plot(iters, novelties, color='#AB47BC', linewidth=1.5,
+        linestyle=':', alpha=0.7, label='Novelty (參考)')
 
-    # 合併圖例
-    lines = line1 + line2 + line3 + line4
-    labels = [l.get_label() for l in lines]
-    ax1.legend(lines, labels, loc='lower right', fontsize=10)
+    ax.axhline(y=0.8, color='red', linewidth=1.2,
+           linestyle='--', alpha=0.6, label='目標線 (0.8)')
+    ax.set_ylim(-0.05, 1.1)
+    ax.legend(loc='lower right', fontsize=10)
 
-    plt.title('SQMG Multi-Objective Optimization Trajectory', fontsize=15, pad=15)
+    plt.title('Validity & Uniqueness Convergence', fontsize=15, pad=15)
     fig.tight_layout()
 
     filepath = os.path.join(output_dir, filename)
@@ -332,17 +314,13 @@ def plot_convergence_curve(
         圖片儲存路徑
     """
     iters = [h['iteration'] + 1 for h in history]
-    gbest = [h['gbest_fitness'] for h in history]
+    gbest = [h.get('gbest_fitness', 0) for h in history]
     mean_fit = [h.get('mean_fitness', 0) for h in history]
 
     fig, ax = plt.subplots(figsize=(10, 6))
 
     ax.plot(iters, gbest, 'b-', linewidth=2.5, marker='o', markersize=4,
             label='Global Best Fitness')
-    ax.fill_between(iters,
-                    [h.get('min_fitness', 0) for h in history],
-                    [h.get('max_fitness', 0) for h in history],
-                    alpha=0.2, color='blue', label='Min-Max Range')
     ax.plot(iters, mean_fit, 'g--', linewidth=1.5, alpha=0.7,
             label='Mean Fitness')
 
