@@ -234,10 +234,13 @@ def export_molecules_csv(molecules: List[Dict], filepath: str):
     logger_print(f'  分子列表已匯出至: {filepath}')
 
 
-def analyze_best_result(best_params: np.ndarray, kernel: SQMGKernel, decoder: MoleculeDecoder):
+def analyze_best_result(
+    best_params: np.ndarray, kernel: SQMGKernel, decoder: MoleculeDecoder,
+) -> Tuple[List[Dict], List[Dict]]:
+    """回傳 (valid_results, decoded)，讓呼叫端可直接複用高精度取樣結果。"""
     if best_params is None or len(best_params) != kernel.n_params:
         logger_print('\n⚠ 無可分析的最佳參數。')
-        return []
+        return [], []
 
     logger_print('\n' + '=' * 70)
     logger_print('最終結果分析')
@@ -265,7 +268,7 @@ def analyze_best_result(best_params: np.ndarray, kernel: SQMGKernel, decoder: Mo
 
     logger_print('\n最佳參數向量：')
     logger_print(f'  np.array({best_params.tolist()})')
-    return valid_results
+    return valid_results, decoded
 
 
 def main():
@@ -371,6 +374,7 @@ def main():
         bond_param_indices=bond_param_indices,
         use_chem_constraints=True,
         use_async_sampling=True,
+        rank=MPI_RANK,
     )
 
     logger_print(f"\n{'─' * 70}\nStep 7: 執行 SOQPSO 優化\n{'─' * 70}")
@@ -382,7 +386,7 @@ def main():
     logger_print(f'  最佳 fitness      : {best_fitness:.6f}')
 
     logger_print(f"\n{'─' * 70}\nStep 8: 分析最佳結果\n{'─' * 70}")
-    valid_results = analyze_best_result(best_params, kernel, decoder)
+    valid_results, final_decoded = analyze_best_result(best_params, kernel, decoder)
     existing_smiles = {molecule['smiles'] for molecule in all_molecules if molecule.get('smiles')}
     for item in valid_results:
         smiles = item.get('smiles')
@@ -393,10 +397,8 @@ def main():
             })
             existing_smiles.add(smiles)
 
-    # Final metrics summary
+    # Final metrics summary — 直接複用 analyze_best_result 的 4× shots 高精度取樣
     if IS_MAIN_PROCESS:
-        counts_final = kernel.sample(np.asarray(best_params, dtype=np.float64))
-        final_decoded = decoder.decode_counts(counts_final)
         final_metrics = evaluator.evaluate(final_decoded)
         logger_print(f"\n{'─' * 70}")
         logger_print("最終評估指標 (Validity / Uniqueness / Novelty)：")

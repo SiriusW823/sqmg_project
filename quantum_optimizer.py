@@ -3,7 +3,7 @@
 SOQPSOOptimizer — 單目標量子粒子群優化 (SOQPSO)
 ==============================================================================
 
-極大化單一標量適應度 fitness_score = validity * uniqueness * length_penalty。
+極大化單一標量適應度 fitness_score = validity * uniqueness。
   • 支援 CUDA-Q sample_async + mqpu 多 GPU 非同步評估
   • 支援化學先驗限制（bond 角度範圍與角度和約束）
   • Delta 勢阱模型圍繞 mbest (平均最佳位置) 與全域 gbest 進行收斂
@@ -50,6 +50,7 @@ class SOQPSOOptimizer:
         atom_param_indices: Optional[List[int]] = None,
         bond_param_indices: Optional[List[Tuple[int, str]]] = None,
         use_async_sampling: bool = True,
+        rank: int = 0,
     ):
         self.D = n_params
         self.M = n_particles
@@ -72,6 +73,7 @@ class SOQPSOOptimizer:
         self.alpha_stag_boost = alpha_stag_boost
         self.use_chem_constraints = use_chem_constraints
         self.use_async_sampling = use_async_sampling
+        self.rank = rank
 
         self.atom_param_indices = atom_param_indices or list(range(self.D))
         self.bond_param_indices = bond_param_indices or []
@@ -241,7 +243,7 @@ class SOQPSOOptimizer:
 
         self._stagnation_counter = 0
         self._total_reinits += 1
-        if self.verbose:
+        if self.verbose and self.rank == 0:
             print(
                 f"  [停滯偵測] 已重初始化 {n_reinit} 個粒子 "
                 f"(累計 {self._total_reinits} 次)"
@@ -318,7 +320,7 @@ class SOQPSOOptimizer:
             try:
                 return self._evaluate_with_async_sampling()
             except Exception as exc:
-                if self.verbose:
+                if self.verbose and self.rank == 0:
                     print(f"  [Async 評估警告] 退回同步 fitness_fn：{exc}")
         return self._evaluate_with_fitness_fn()
 
@@ -329,17 +331,18 @@ class SOQPSOOptimizer:
         if self.fitness_fn is None and (self.kernel is None or self.decoder is None):
             raise ValueError('至少需要 fitness_fn，或同時提供 kernel 與 decoder。')
 
-        print('=' * 70)
-        print('SOQPSO 單目標量子粒子群優化啟動')
-        print(f'  粒子數 (M)       : {self.M}')
-        print(f'  參數維度 (D)     : {self.D}')
-        print(f'  最大迭代 (T)     : {self.T}')
-        print(f'  α 範圍           : {self.alpha_max} → {self.alpha_min}')
-        print(f'  有效化學限制     : {self.use_chem_constraints}')
-        print(f'  停滯門檻         : {self.stagnation_limit} 代')
-        print(f'  重初始化比例     : {self.reinit_fraction:.0%}')
-        print(f'  變異機率         : {self.mutation_prob:.0%}')
-        print('=' * 70)
+        if self.rank == 0:
+            print('=' * 70)
+            print('SOQPSO 單目標量子粒子群優化啟動')
+            print(f'  粒子數 (M)       : {self.M}')
+            print(f'  參數維度 (D)     : {self.D}')
+            print(f'  最大迭代 (T)     : {self.T}')
+            print(f'  α 範圍           : {self.alpha_max} → {self.alpha_min}')
+            print(f'  有效化學限制     : {self.use_chem_constraints}')
+            print(f'  停滯門檻         : {self.stagnation_limit} 代')
+            print(f'  重初始化比例     : {self.reinit_fraction:.0%}')
+            print(f'  變異機率         : {self.mutation_prob:.0%}')
+            print('=' * 70)
 
         # 初始評估
         initial_results = self._evaluate_swarm()
@@ -401,10 +404,10 @@ class SOQPSOOptimizer:
                 try:
                     self.iteration_callback(t, iter_record)
                 except Exception as exc:
-                    if self.verbose:
+                    if self.verbose and self.rank == 0:
                         print(f'  [Callback 警告] {exc}')
 
-            if self.verbose:
+            if self.verbose and self.rank == 0:
                 print(
                     f"[Iter {t + 1:3d}/{self.T}] "
                     f"α={alpha:.4f} "
@@ -419,12 +422,13 @@ class SOQPSOOptimizer:
         if self.gbest_position is None:
             return np.zeros(self.D, dtype=np.float64), 0.0, self.history
 
-        print('\n' + '=' * 70)
-        print('SOQPSO 優化完成')
-        print(f'  Best fitness      : {self.gbest_fitness:.6f}')
-        print(f'  總重初始化次數   : {self._total_reinits}')
-        print(f'  總變異粒子次數   : {self._total_mutations}')
-        print('=' * 70)
+        if self.rank == 0:
+            print('\n' + '=' * 70)
+            print('SOQPSO 優化完成')
+            print(f'  Best fitness      : {self.gbest_fitness:.6f}')
+            print(f'  總重初始化次數   : {self._total_reinits}')
+            print(f'  總變異粒子次數   : {self._total_mutations}')
+            print('=' * 70)
 
         return self.gbest_position.copy(), self.gbest_fitness, self.history
 
