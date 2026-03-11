@@ -94,8 +94,8 @@ class SOQPSOOptimizer:
                         self.lb_vec[idx] = 0.0
                         self.ub_vec[idx] = np.pi
                     elif bond_type == 'double_triple':
-                        self.lb_vec[idx] = 0.0
-                        self.ub_vec[idx] = np.pi / 2.0
+                        self.lb_vec[idx] = np.pi / 2.0  # [π/2, π]
+                        self.ub_vec[idx] = np.pi
 
         self.rng = np.random.default_rng(seed)
         self.positions = self._random_positions(self.M)
