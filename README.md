@@ -44,7 +44,7 @@
 | 暫存器 | 量子位元數 | 策略 | 說明 |
 |--------|-----------|------|------|
 | Atom Register | 3N | 靜態分配 | 每個重原子 3 顆量子位元 → 8 種原子類型 |
-| Bond Register | 2 | 動態重複使用 | 透過 mid-circuit measurement + reset 在 N-1 個鍵結間重複使用 |
+| Bond Register | 2 | 動態重複使用 | 透過 mid-circuit measurement + reset 在 N(N-1)/2 個鍵結間重複使用 |
 | Ancilla | 1 | 單次使用後 uncompute | OR 非 NONE 原子偵測，控制 Bond Register |
 
 ### 原子類型映射 (8 States)
@@ -74,7 +74,8 @@
 | 面向 | QMG (原始論文) | SQMG (本專案) |
 |------|---------------|---------------|
 | 量子框架 | Qiskit / Cirq | NVIDIA CUDA-Q (GPU 加速) |
-| 量子位元策略 | 固定分配 | Atom no reuse + Bond reuse (3N+2) |
+| 量子位元策略 | 固定分配 | Atom no reuse + Bond reuse (3N+3) |
+| 鍵結拓撲 | 全上三角矩陣 N(N-1)/2 bonds | 全上三角矩陣 N(N-1)/2 bonds |
 | 優化器 | 貝葉斯優化 (GPEI/SAASBO) | QPSO 量子粒子群優化 |
 | 模擬加速 | CPU 模擬 | GPU Tensor Network / Statevector |
 

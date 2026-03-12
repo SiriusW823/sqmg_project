@@ -346,12 +346,11 @@ def main():
     iteration_callback = create_iteration_callback(kernel, decoder, evaluator, extended_history, all_molecules, best_so_far)
 
     logger_print(f"\n{'─' * 70}\nStep 6: 初始化 SOQPSO 優化器\n{'─' * 70}")
-    # [FIX-CHEM] v5 Kernel 每個原子 15 個參數，每個鍵 6 個參數
-    n_atom_params = 15 * args.max_atoms
-    n_bond_pairs = args.max_atoms - 1
+    # 全上三角鍵結：N*(N-1)/2 bonds，每個 bond 6 params
+    n_bonds = kernel.max_atoms * (kernel.max_atoms - 1) // 2
     bond_param_indices = []
-    for bp_idx in range(n_bond_pairs):
-        base = n_atom_params + 6 * bp_idx
+    for bp_idx in range(n_bonds):
+        base = kernel.n_atom_params + 6 * bp_idx
         bond_param_indices.append((base, 'single_double'))
         bond_param_indices.append((base + 1, 'double_triple'))
 

@@ -2,14 +2,13 @@ from __future__ import annotations
 
 """
 ==============================================================================
-MoleculeDecoder — 線性相鄰鍵 (Linear Chain) bit-string 分子解碼器
+MoleculeDecoder — 全上三角鍵結 (Full Upper-Triangular) bit-string 分子解碼器
 ==============================================================================
-# MODIFIED: FIX-P0-1, FIX-P0-2, FIX-P1-1, FIX-QED, FIX-HYPER, FIX-CHEM, FIX-GPU
 
-修改原因：
-  • bit-string 已改為線性相鄰鍵 (N-1) bond 編碼，需同步更新解析與建模流程
-  • validity 需改為以總 shots 為分母，避免系統性高估
-  • 已移除 QED 計算，專注於 Validity × Uniqueness 單一目標
+• 使用全上三角鄰接矩陣 N(N-1)/2 bonds，可表達分支與環狀結構
+• bit-string 長度 = 3N + 2·N(N-1)/2 = N² + 2N
+• validity 以總 shots 為分母，避免系統性高估
+• fitness = Validity × Uniqueness（無 QED / length_penalty）
 ==============================================================================
 """
 
@@ -55,14 +54,23 @@ else:
 
 
 def generate_bond_pairs(max_atoms: int) -> List[Tuple[int, int]]:
-    """回傳線性相鄰的鍵對，對齊 v5 Kernel 只測量相鄰原子的鍵。"""
-    return [(i, i + 1) for i in range(max_atoms - 1)]
+    """回傳全上三角鍵對 (i, j) where i < j，對齊 SQMG 論文的鄰接矩陣設計。
+
+    bond 數量 = N*(N-1)/2
+    例：N=4 → (0,1),(0,2),(0,3),(1,2),(1,3),(2,3)，共 6 個鍵
+    """
+    return [(i, j) for i in range(max_atoms) for j in range(i + 1, max_atoms)]
 
 
 class MoleculeDecoder:
     """將 CUDA-Q sample 結果解碼為分子與品質指標。"""
 
     def __init__(self, max_atoms: int = 4):
+        """初始化解碼器。
+
+        expected_length = 3*N + 2*(N*(N-1)//2) = N² + 2N
+        例：N=4 → 24 bits（12 bond bits + 12 atom bits）
+        """
         self.max_atoms = max_atoms
         self.bond_pairs = generate_bond_pairs(max_atoms)
         self.expected_length = 3 * max_atoms + 2 * len(self.bond_pairs)
