@@ -4,21 +4,16 @@ SOQPSOOptimizer — 單目標量子粒子群優化 (SOQPSO)
 ==============================================================================
 
 極大化單一標量適應度 fitness_score = validity * uniqueness。
-  • 支援 CUDA-Q sample_async + mqpu 多 GPU 非同步評估
+
   • 支援化學先驗限制（bond 角度範圍與角度和約束）
   • Delta 勢阱模型圍繞 mbest (平均最佳位置) 與全域 gbest 進行收斂
 ==============================================================================
 """
 
 import math
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
-
-try:
-    import cudaq
-except ImportError:
-    cudaq = None
 
 
 class SOQPSOOptimizer:
@@ -35,8 +30,8 @@ class SOQPSOOptimizer:
         shots: int = 1024,
         alpha_max: float = 1.2,
         alpha_min: float = 0.4,
-        param_lower: float = -np.pi,
-        param_upper: float = np.pi,
+        param_lower: Union[float, np.ndarray] = -np.pi,
+        param_upper: Union[float, np.ndarray] = np.pi,
         seed: Optional[int] = None,
         verbose: bool = True,
         iteration_callback: Optional[Callable[[int, dict], None]] = None,
@@ -49,8 +44,6 @@ class SOQPSOOptimizer:
         use_chem_constraints: bool = True,
         atom_param_indices: Optional[List[int]] = None,
         bond_param_indices: Optional[List[Tuple[int, str]]] = None,
-        use_async_sampling: bool = True,
-        rank: int = 0,
     ):
         self.D = n_params
         self.M = n_particles
@@ -61,41 +54,73 @@ class SOQPSOOptimizer:
         self.shots = shots if shots is not None else getattr(kernel, 'shots', 1024)
         self.alpha_max = alpha_max
         self.alpha_min = alpha_min
-        self.lb = param_lower
-        self.ub = param_upper
         self.verbose = verbose
         self.iteration_callback = iteration_callback
         self.stagnation_limit = stagnation_limit
         self.reinit_fraction = reinit_fraction
         self.mutation_prob = mutation_prob
-        self.mutation_scale = mutation_scale * (param_upper - param_lower)
         self.alpha_perturb_std = alpha_perturb_std
         self.alpha_stag_boost = alpha_stag_boost
         self.use_chem_constraints = use_chem_constraints
-        self.use_async_sampling = use_async_sampling
-        self.rank = rank
 
         self.atom_param_indices = atom_param_indices or list(range(self.D))
         self.bond_param_indices = bond_param_indices or []
         self.bond_angle_pairs: List[Tuple[int, int]] = []
-        for pair_start in range(0, len(self.bond_param_indices), 2):
+        for pair_start in range(0, len(self.bond_param_indices), 3):
             if pair_start + 1 < len(self.bond_param_indices):
                 lhs_idx = self.bond_param_indices[pair_start][0]
                 rhs_idx = self.bond_param_indices[pair_start + 1][0]
                 self.bond_angle_pairs.append((lhs_idx, rhs_idx))
 
-        self.lb_vec = np.full(self.D, self.lb, dtype=np.float64)
-        self.ub_vec = np.full(self.D, self.ub, dtype=np.float64)
+        # 【支援陣列型別的邊界】實作化學先驗限制
+        if isinstance(param_lower, (float, int)):
+            self.param_lower = np.full(self.D, float(param_lower), dtype=np.float64)
+        else:
+            self.param_lower = np.asarray(param_lower, dtype=np.float64)
+
+        if isinstance(param_upper, (float, int)):
+            self.param_upper = np.full(self.D, float(param_upper), dtype=np.float64)
+        else:
+            self.param_upper = np.asarray(param_upper, dtype=np.float64)
+
+        assert self.param_lower.shape == (self.D,), "param_lower 維度必須等於 n_params"
+        assert self.param_upper.shape == (self.D,), "param_upper 維度必須等於 n_params"
+
+        # lb_vec / ub_vec 為實際使用的邊界向量（在 param_lower/upper 基礎上疊加化學限制）
+        self.lb_vec = self.param_lower.copy()
+        self.ub_vec = self.param_upper.copy()
 
         if use_chem_constraints and bond_param_indices:
             for idx, bond_type in bond_param_indices:
                 if idx < self.D:
-                    if bond_type == 'single_double':
-                        self.lb_vec[idx] = 0.0
-                        self.ub_vec[idx] = np.pi
-                    elif bond_type == 'double_triple':
-                        self.lb_vec[idx] = np.pi / 2.0  # [π/2, π]
-                        self.ub_vec[idx] = np.pi
+                    if bond_type == 'bond_existence':
+                        # 控制鍵結是否存在（|00⟩→|10⟩）：範圍 [0, π/2]
+                        # 由 sqmg_kernel.get_param_bounds() 已設定；此處取交集確保一致。
+                        self.lb_vec[idx] = max(self.lb_vec[idx], 0.0)
+                        self.ub_vec[idx] = min(self.ub_vec[idx], np.pi / 2)
+                    elif bond_type == 'bond_order':
+                        # 控制鍵結階數升級（|10⟩→|11⟩ 單鍵→雙鍵）：範圍 [0, π/2]
+                        # 對應 QMG Eq.2，使雙鍵機率 ≤ 50%。
+                        self.lb_vec[idx] = max(self.lb_vec[idx], 0.0)
+                        self.ub_vec[idx] = min(self.ub_vec[idx], np.pi / 2)
+                    elif bond_type == 'bond_triple_order':
+                        # 控制鍵結階數升級（|11⟩→|01⟩ 雙鍵→三鍵）：範圍 [0, π/2]
+                        # 對應 QMG Eq.3 精神，使三鍵機率 ≤ 50%（比雙鍵更少見）。
+                        self.lb_vec[idx] = max(self.lb_vec[idx], 0.0)
+                        self.ub_vec[idx] = min(self.ub_vec[idx], np.pi / 2)
+                    # 向後相容：舊標籤仍接受，避免已存在的呼叫端報錯
+                    elif bond_type in ('single_double', 'double_triple'):
+                        self.lb_vec[idx] = max(self.lb_vec[idx], 0.0)
+                        self.ub_vec[idx] = min(self.ub_vec[idx], np.pi / 2)
+
+        if use_chem_constraints:
+            # 第一個 atom 的第一個 RY 參數限制在 [0, π]，
+            # 確保 q[0] 偏向 |1⟩，降低第一個原子輸出 NONE(|000⟩) 的機率
+            self.lb_vec[0] = max(self.lb_vec[0], 0.0)
+            self.ub_vec[0] = min(self.ub_vec[0], np.pi)
+
+        # mutation_scale 使用向量化範圍
+        self.mutation_scale = mutation_scale * (self.ub_vec - self.lb_vec)
 
         self.rng = np.random.default_rng(seed)
         self.positions = self._random_positions(self.M)
@@ -117,7 +142,8 @@ class SOQPSOOptimizer:
     # 內部工具
     # ------------------------------------------------------------------
     def _random_positions(self, n_samples: int) -> np.ndarray:
-        positions = self.rng.uniform(self.lb_vec, self.ub_vec, size=(n_samples, self.D))
+        """生成隨機初始位置，使用廣播機制適應 Array 邊界。"""
+        positions = self.param_lower + self.rng.random((n_samples, self.D)) * (self.param_upper - self.param_lower)
         return np.array([self._apply_chem_constraints(pos) for pos in positions])
 
     def _get_alpha(self, t: int) -> float:
@@ -132,38 +158,49 @@ class SOQPSOOptimizer:
         return np.mean(self.pbest, axis=0)
 
     def _apply_chem_constraints(self, x: np.ndarray) -> np.ndarray:
+        """Bond Existence 參數的化學先驗約束（全上三角拓撲適用版）。
+
+        ── 問題背景 ──
+        QMG 論文 Eq.1 原本針對「循序動態電路」設計：atom i 只與之前的 atoms {1,...,i-1}
+        形成鍵結，因此每個新原子的所有 bond existence 角之和可以獨立設為 π（等式約束）。
+
+        SQMG 使用全上三角矩陣：每個原子與其餘所有原子均有潛在鍵結，因此同一個
+        bond existence 參數（如 bond(0,1)）同時出現在 atom 0 和 atom 1 的約束集合中。
+        對兩個原子分別套用「等式約束 sum=π」會形成相互覆寫的矛盾系統，無法同時滿足。
+
+        ── 本實作策略 ──
+        改為對每個 bond existence 參數套用「per-bond 上界約束」：
+          每個 bond existence 角 θ_exist ≤ π / (N-1)
+        語意：每個 bond 最多佔用一個原子總成鍵預算 π 的 1/(N-1)，
+        確保任何單一原子不會因某一鍵而耗盡所有成鍵預算。
+
+        這是從 Eq.1 精神導出的可行近似，避免全上三角拓撲下的約束衝突，
+        同時保留化學先驗（防止超價）。
+        """
         x_new = np.clip(np.array(x, dtype=np.float64).copy(), self.lb_vec, self.ub_vec)
         if not self.use_chem_constraints:
             return x_new
 
-        for idx0, idx1 in self.bond_angle_pairs:
-            total = float(x_new[idx0] + x_new[idx1])
-            target_total = float(np.clip(total, np.pi / 2.0, 3.0 * np.pi / 2.0))
-            if abs(target_total - total) < 1e-12:
-                continue
+        n_atoms = self.kernel.max_atoms if hasattr(self, 'kernel') and self.kernel else 0
+        if n_atoms < 2:
+            return x_new
 
-            ratio = float(x_new[idx0] / total) if abs(total) > 1e-12 else 2.0 / 3.0
-            theta0 = float(np.clip(target_total * ratio, self.lb_vec[idx0], self.ub_vec[idx0]))
-            theta1 = float(np.clip(target_total - theta0, self.lb_vec[idx1], self.ub_vec[idx1]))
+        bond_start_idx = n_atoms * 9
 
-            repaired_total = theta0 + theta1
-            if repaired_total < np.pi / 2.0:
-                deficit = np.pi / 2.0 - repaired_total
-                add1 = min(deficit, self.ub_vec[idx1] - theta1)
-                theta1 += add1
-                deficit -= add1
-                if deficit > 0.0:
-                    theta0 = min(self.ub_vec[idx0], theta0 + deficit)
-            elif repaired_total > 3.0 * np.pi / 2.0:
-                excess = repaired_total - 3.0 * np.pi / 2.0
-                cut1 = min(excess, theta1 - self.lb_vec[idx1])
-                theta1 -= cut1
-                excess -= cut1
-                if excess > 0.0:
-                    theta0 = max(self.lb_vec[idx0], theta0 - excess)
+        # per-bond 上界：每個 bond existence 角 ≤ π / (N-1)
+        # 直覺：若每個原子最多參與 N-1 個鍵，且每個鍵的貢獻均等，
+        # 則單鍵的存在角上限為 π/(N-1)，確保每個原子的成鍵預算不超過 π。
+        per_bond_max = np.pi / max(n_atoms - 1, 1)
 
-            x_new[idx0] = theta0
-            x_new[idx1] = theta1
+        n_bonds = n_atoms * (n_atoms - 1) // 2
+        for bond_idx in range(n_bonds):
+            theta_exist_idx = bond_start_idx + bond_idx * 3  # v7: 3 params/bond (was 2)
+            if theta_exist_idx < len(x_new):
+                x_new[theta_exist_idx] = np.clip(
+                    x_new[theta_exist_idx],
+                    self.lb_vec[theta_exist_idx],
+                    min(self.ub_vec[theta_exist_idx], per_bond_max),
+                )
 
         return np.clip(x_new, self.lb_vec, self.ub_vec)
 
@@ -191,7 +228,7 @@ class SOQPSOOptimizer:
         x_mut = x.copy()
         n_mutate = max(1, int(self.D * self.rng.uniform(0.2, 0.4)))
         dims = self.rng.choice(self.D, size=n_mutate, replace=False)
-        noise = self.rng.standard_cauchy(size=n_mutate) * self.mutation_scale
+        noise = self.rng.standard_cauchy(size=n_mutate) * self.mutation_scale[dims]
         x_mut[dims] += noise
         x_mut = np.clip(x_mut, self.lb_vec, self.ub_vec)
         return self._apply_chem_constraints(x_mut)
@@ -243,7 +280,7 @@ class SOQPSOOptimizer:
 
         self._stagnation_counter = 0
         self._total_reinits += 1
-        if self.verbose and self.rank == 0:
+        if self.verbose:
             print(
                 f"  [停滯偵測] 已重初始化 {n_reinit} 個粒子 "
                 f"(累計 {self._total_reinits} 次)"
@@ -252,77 +289,15 @@ class SOQPSOOptimizer:
     # ------------------------------------------------------------------
     # 群體評估
     # ------------------------------------------------------------------
-    def _get_num_qpus(self) -> int:
-        if cudaq is None:
-            return 1
-        try:
-            target = cudaq.get_target()
-            value = getattr(target, 'num_qpus', None)
-            if callable(value):
-                return max(1, int(value()))
-            if value is not None:
-                return max(1, int(value))
-        except Exception:
-            pass
-        try:
-            return max(1, int(cudaq.num_available_gpus()))
-        except Exception:
-            return 1
-
-    def _evaluate_with_async_sampling(self) -> List[Tuple[int, float, List[str], List[dict]]]:
-        if cudaq is None or self.kernel is None or self.decoder is None:
-            raise RuntimeError("cudaq / kernel / decoder 未正確設定，無法進行非同步評估")
-        if not hasattr(cudaq, 'sample_async'):
-            raise RuntimeError("cudaq.sample_async 不可用，請 fallback 至同步評估")
-
-        n_qpus = self._get_num_qpus()
-        futures = []
-        for i in range(self.M):
-            qpu_id = i % n_qpus
-            future = cudaq.sample_async(
-                self.kernel.kernel_func,
-                self.positions[i].tolist(),
-                self.kernel.max_atoms,
-                shots_count=self.shots,
-                qpu_id=qpu_id,
-            )
-            futures.append((i, future))
-
-        results: List[Tuple[int, float, List[str], List[dict]]] = []
-        for i, future in futures:
-            counts_result = future.get()
-            counts_dict: Dict[str, int] = {}
-            for bitstring, count in counts_result.items():
-                counts_dict[bitstring.replace(' ', '')] = int(count)
-
-            fitness_score, decoded = self.decoder.compute_fitness(counts_dict)
-            smiles_list = [
-                record['smiles']
-                for record in decoded
-                if record.get('valid') and record.get('smiles') and not record.get('partial_valid')
-            ]
-            results.append((i, float(fitness_score), smiles_list, decoded))
-
-        return results
-
-    def _evaluate_with_fitness_fn(self) -> List[Tuple[int, float, List[str], List[dict]]]:
+    def _evaluate_swarm(self) -> List[Tuple[int, float, List[str], List[dict]]]:
         if self.fitness_fn is None:
-            raise ValueError('fitness_fn 未設定，且無法使用 CUDA-Q 非同步評估。')
+            raise ValueError('fitness_fn 未設定。')
 
         results: List[Tuple[int, float, List[str], List[dict]]] = []
         for i in range(self.M):
             fitness_score, smiles_list, decoded = self.fitness_fn(self.positions[i])
             results.append((i, float(fitness_score), list(smiles_list or []), list(decoded)))
         return results
-
-    def _evaluate_swarm(self) -> List[Tuple[int, float, List[str], List[dict]]]:
-        if self.use_async_sampling and self.kernel is not None and self.decoder is not None:
-            try:
-                return self._evaluate_with_async_sampling()
-            except Exception as exc:
-                if self.verbose and self.rank == 0:
-                    print(f"  [Async 評估警告] 退回同步 fitness_fn：{exc}")
-        return self._evaluate_with_fitness_fn()
 
     # ------------------------------------------------------------------
     # 主優化迴圈
@@ -331,7 +306,7 @@ class SOQPSOOptimizer:
         if self.fitness_fn is None and (self.kernel is None or self.decoder is None):
             raise ValueError('至少需要 fitness_fn，或同時提供 kernel 與 decoder。')
 
-        if self.rank == 0:
+        if self.verbose:
             print('=' * 70)
             print('SOQPSO 單目標量子粒子群優化啟動')
             print(f'  粒子數 (M)       : {self.M}')
@@ -404,10 +379,10 @@ class SOQPSOOptimizer:
                 try:
                     self.iteration_callback(t, iter_record)
                 except Exception as exc:
-                    if self.verbose and self.rank == 0:
+                    if self.verbose:
                         print(f'  [Callback 警告] {exc}')
 
-            if self.verbose and self.rank == 0:
+            if self.verbose:
                 print(
                     f"[Iter {t + 1:3d}/{self.T}] "
                     f"α={alpha:.4f} "
@@ -422,7 +397,7 @@ class SOQPSOOptimizer:
         if self.gbest_position is None:
             return np.zeros(self.D, dtype=np.float64), 0.0, self.history
 
-        if self.rank == 0:
+        if self.verbose:
             print('\n' + '=' * 70)
             print('SOQPSO 優化完成')
             print(f'  Best fitness      : {self.gbest_fitness:.6f}')

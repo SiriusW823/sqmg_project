@@ -15,37 +15,39 @@
 │  ┌──────────────┐    cudaq.sample()   ┌──────────────────────┐  │
 │  │  SQMGKernel  │ ──────────────────► │  MoleculeDecoder     │  │
 │  │  (CUDA-Q     │    bit-strings      │  (RDKit)             │  │
-│  │   3N+3       │                     │  ┌────────────────┐  │  │
+│  │   3N+2       │                     │  ┌────────────────┐  │  │
 │  │   Ansatz)    │                     │  │ Atom: 3-bit    │  │  │
 │  │              │                     │  │ Bond: 2-bit    │  │  │
 │  │  Atom Reg:   │                     │  │ → SMILES       │  │  │
 │  │  3N qubits   │                     │  └────────────────┘  │  │
 │  │  Bond Reg:   │                     └──────────┬───────────┘  │
 │  │  2 qubits    │                                │              │
-│  │  (reused)    │                        fitness  │              │
+│  │  (reused)    │                        fitness  │             │
 │  └──────┬───────┘                                │              │
 │         │                                        ▼              │
 │         │  params (θ)               ┌──────────────────────┐    │
 │         └───────────────────────────│  QuantumOptimizer    │    │
 │                                     │  (QPSO)              │    │
 │                                     │                      │    │
-│                                     │  • Delta 勢阱模型    │    │
-│                                     │  • mbest 全域吸引    │    │
+│                                     │  • Delta 勢阱模型     │    │
+│                                     │  • mbest 全域吸引     │    │
 │                                     │  • α 排程 (1.0→0.5)  │    │
-│                                     │  • 無梯度優化        │    │
+│                                     │  • 無梯度優化         │    │
 │                                     └──────────────────────┘    │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-## 3N+3 量子位元架構
+## 3N+2 量子位元架構
 
-本系統採用 **3N+3 Ansatz**（N = 重原子數量上限）：
+本系統採用 **3N+2 Ansatz**（N = 重原子數量上限）：
 
 | 暫存器 | 量子位元數 | 策略 | 說明 |
 |--------|-----------|------|------|
-| Atom Register | 3N | 靜態分配 | 每個重原子 3 顆量子位元 → 8 種原子類型 |
-| Bond Register | 2 | 動態重複使用 | 透過 mid-circuit measurement + reset 在 N(N-1)/2 個鍵結間重複使用 |
-| Ancilla | 1 | 單次使用後 uncompute | OR 非 NONE 原子偵測，控制 Bond Register |
+| Atom Register | 3N | 靜態分配 | 每個重原子 3 個量子位元，1 層 HEA（RY×3+RZ×3+Ring-CNOT+RY×3），9p/atom |
+| Bond Register | 2 | 動態重複使用 | RY + Ctrl-RY(single→double) + Ctrl-RY(double→triple)，3p/bond，N(N-1)/2 bonds，可達態：|00⟩無鍵/|10⟩單鍵/|11⟩雙鍵/|01⟩三鍵 |
+
+> ℹ **Bond subcircuit (v7)**：每個鍵使用 3 個參數（Gate 1: RY bond_existence, Gate 2: CRY single→double, Gate 3: CRY double→triple），可達 4 種鍵結態。總參數量公式為 **9N + 3·N(N-1)/2**。
+> SQMG 論文 Table I 的 **N²+9N-1** 對應 9N（HEA）+ (N-1)（Cross-atom CRY）+ 2·N(N-1)/2（2p/bond）；本程式碼改採 3p/bond 實現三鍵，捨棄 Cross-atom CRY，兩者均無法對齊論文參數量。
 
 ### 原子類型映射 (8 States)
 
@@ -60,24 +62,65 @@
 | \|110⟩ | F | 氟 (Fluorine) |
 | \|111⟩ | Cl | 氯 (Chlorine) |
 
-### 鍵結類型映射
+### 鍵結類型映射 (v7：4 種可達態)
 
-| 量子態 | 鍵結 |
-|--------|------|
-| \|00⟩ | 無鍵 |
-| \|01⟩ | 單鍵 (Single) |
-| \|10⟩ | 雙鍵 (Double) |
-| \|11⟩ | 參鍵 (Triple) |
+Bond 子電路使用 3-gate 設計（對應 Chen et al. QMG Eq.2-3）：
+
+| 量子態 | 可達 | 鍵結 | 產生路徑 |
+|--------|------|------|---------|
+| \|00⟩ | ✓ | 無鍵 | Gate 1 未激發 |
+| \|10⟩ | ✓ | 單鍵 (Single) | Gate 1 激發，Gate 2 未激發 |
+| \|11⟩ | ✓ | 雙鍵 (Double) | Gate 1+2 激發，Gate 3 未激發 |
+| \|01⟩ | ✓ | 三鍵 (Triple) | Gate 1+2+3 均激發 |
+
+參數邊界（Hierarchical Bounds）：
+- Gate 1 `bond_existence`    ∈ [0, π/2]：P(bond) ≤ 50%
+- Gate 2 `bond_order`        ∈ [0, π/2]：P(double\|bond) ≤ 50%（對應 Eq.2）
+- Gate 3 `bond_triple_order` ∈ [0, π/2]：P(triple\|double) ≤ 50%（等效 Eq.3）
 
 ## 與 QMG 原始論文的差異
 
 | 面向 | QMG (原始論文) | SQMG (本專案) |
 |------|---------------|---------------|
 | 量子框架 | Qiskit / Cirq | NVIDIA CUDA-Q (GPU 加速) |
-| 量子位元策略 | 固定分配 | Atom no reuse + Bond reuse (3N+3) |
+| 量子位元策略 | 2-qubit atom + 全動態 (QMG) | 3-qubit atom + Atom no reuse + Bond reuse，無 Ancilla (SQMG) |
 | 鍵結拓撲 | 全上三角矩陣 N(N-1)/2 bonds | 全上三角矩陣 N(N-1)/2 bonds |
-| 優化器 | 貝葉斯優化 (GPEI/SAASBO) | QPSO 量子粒子群優化 |
+| 優化器 | BO（Chen et al. 用 GPEI/SAASBO；SQMG 論文用 COBYLA + GP-EI） | QPSO 量子粒子群優化（Delta 勢阱，取代兩篇論文的 BO） |
 | 模擬加速 | CPU 模擬 | GPU Tensor Network / Statevector |
+
+### Table I — 參數量對照表
+
+> ⚠ **注意**：SQMG 論文 N²+9N-1 = 9N（HEA）+ (N-1)（Cross-atom CRY）+ 2×N(N-1)/2（2p/bond）。
+> 本程式碼 v7 改採 **3p/bond** 以支援三鍵，放棄 Cross-atom CRY，
+> 公式為 **9N + 3·N(N-1)/2**，與論文及 v6 均不同。
+
+| N | 論文 static qubits | SQMG hybrid qubits | 論文 params (N²+9N-1) | v6 params (N²+8N) | **v7 params (9N+3·N(N-1)/2)** |
+|---|--------------------|--------------------|----------------------|-------------------|-------------------------------|
+| 2 | 8 | 8 | 21 | 20 | **21** |
+| 3 | 15 | 11 | 35 | 33 | **36** |
+| 4 | 24 | 14 | 51 | 48 | **54** |
+| 5 | 35 | 17 | 69 | 64 | **69** |
+| 10 | 120 | 32 | 189 | 180 | **225** |
+
+## Backend 選擇指南
+
+| Backend | 適用 N | 硬體需求 | 備註 |
+|---------|--------|---------|------|
+| qpp-cpu | N ≤ 5 | CPU only | 僅供測試 |
+| nvidia | N ≤ 9 | 1× GPU | 超過 N=9 顯存不足 |
+| tensornet | N ≤ 40 | 1-8× GPU | 推薦，cuTensorNet 內部自動多 GPU |
+
+DGX V100 8-GPU 環境下，推薦使用 tensornet：
+```bash
+python main.py --backend tensornet --max_atoms 8 --particles 30 \
+               --iterations 150 --shots 1024
+```
+
+tensornet 多 GPU 並行由 cuTensorNet 函式庫內部處理（splitindex 策略），
+對 Python 層完全透明，不需要 MPI 或 rank 概念。
+根據 SQMG 論文，tensornet 在 N=8 時約 3.45 秒/iteration，
+比 CPU 快約 2,200 倍；同時 atom no-reuse 架構比 atom reuse
+在 N=40 時快約 1.9 倍（論文 Fig.4）。
 
 ## 環境需求
 
@@ -145,7 +188,7 @@ python main.py --help
 | `--shots` | 1024 | 每次量子取樣的重複次數 |
 | `--alpha_max` | 1.2 | QPSO α 初始值 |
 | `--alpha_min` | 0.4 | QPSO α 終值 |
-| `--backend` | nvidia-mqpu | CUDA-Q 後端 (qpp-cpu/nvidia/nvidia-mqpu/tensornet) |
+| `--backend` | tensornet | CUDA-Q 後端 (qpp-cpu/nvidia/tensornet) |
 | `--seed` | 42 | 隨機數種子 |
 | `--verbose_eval` | False | 印出每次適應度評估的詳細資訊 |
 

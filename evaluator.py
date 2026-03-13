@@ -66,20 +66,26 @@ class MoleculeEvaluator:
     """
     分子生成品質評估器。
 
-    計算三大生成指標 (Validity, Uniqueness, Novelty)。
+    計算三大生成指標，採用 QMG Chen et al. JCTC 2025 論文定義（Eq. 4–5）：
+
+        Validity   = N_valid_bitstrings / N_total_bitstrings
+        Uniqueness = N_unique_smiles    / N_valid_bitstrings
+        Novelty    = N_novel_smiles     / N_unique_smiles
+
+    每種 bitstring 等權重計算，可直接與論文報告數字比較。
 
     使用方式：
         evaluator = MoleculeEvaluator(reference_smiles=my_set)
         metrics = evaluator.evaluate(decoded_results)
-        print(metrics)
-        # {'validity': 0.65, 'uniqueness': 0.85, 'novelty': 0.92, ...}
     """
 
-    def __init__(self, reference_smiles: Optional[Set[str]] = None):
+    def __init__(
+        self,
+        reference_smiles: Optional[Set[str]] = None,
+    ):
         """
         Args:
-            reference_smiles: 參考分子的 canonical SMILES 集合。
-                              用於計算 Novelty（不在此集合中的比例）。
+            reference_smiles: 參考分子的 canonical SMILES 集合，用於計算 Novelty。
                               若為 None，使用預設的 Mock 資料集。
         """
         if reference_smiles is not None:
@@ -89,62 +95,41 @@ class MoleculeEvaluator:
 
     def evaluate(self, decoded_results: List[Dict]) -> Dict[str, float]:
         """
-        計算一組解碼結果的完整評估指標。
+        計算一組解碼結果的完整評估指標（QMG 論文定義）。
 
-        定義：
-        ─────
-        • N_total     = len(decoded_results)
-        • N_valid     = 有效分子數（valid == True）
-        • N_unique    = 有效分子中不重複的 SMILES 數量
-        • N_novel     = 唯一有效分子中不在 reference_smiles 內的數量
+        • validity   = N_valid   / N_total       （QMG Eq.4）
+        • uniqueness = N_unique  / N_valid        （QMG Eq.5）
+        • novelty    = N_novel   / N_unique
 
-        指標公式：
-        ──────────
-        • Validity   = N_valid / N_total        （若 N_total == 0 → 0）
-        • Uniqueness = N_unique / N_valid        （若 N_valid == 0 → 0）
-        • Novelty    = N_novel / N_unique        （若 N_unique == 0 → 0）
+        每種 bitstring 等權重，可直接對照論文報告數字。
 
         Args:
             decoded_results: MoleculeDecoder.decode_counts() 的回傳值
 
         Returns:
-            指標字典：
-            {
-                'n_total': int,
-                'n_valid': int,
-                'n_unique': int,
-                'n_novel': int,
-                'validity': float,       # [0, 1]
-                'uniqueness': float,     # [0, 1]
-                'novelty': float,        # [0, 1]
-                'valid_smiles': list[str],     # 所有有效 SMILES（含重複）
-                'unique_smiles': list[str],    # 不重複的有效 SMILES
-                'novel_smiles': list[str],     # 不在參考集中的 SMILES
-            }
+            指標字典（含 'validity', 'uniqueness', 'novelty' 等）
         """
         n_total = len(decoded_results)
 
         if n_total == 0:
             return self._empty_metrics()
 
-        # ── 1. Validity (Shot-weighted) ──
-        total_count = sum(r.get('count', 1) for r in decoded_results)
+        # ── 1. 計算有效分子（QMG Eq.4） ──
         valid_results = [r for r in decoded_results if r.get('valid', False)]
-        valid_count = sum(r.get('count', 1) for r in valid_results)
         n_valid = len(valid_results)
-        validity = valid_count / total_count if total_count > 0 else 0.0
+        validity = n_valid / n_total
 
         if n_valid == 0:
             metrics = self._empty_metrics()
             metrics['n_total'] = n_total
-            metrics['validity'] = 0.0
+            metrics['validity'] = validity
             return metrics
 
-        # 收集所有有效 SMILES（含重複）
+        # 收集所有有效 SMILES
         valid_smiles_list = [r['smiles'] for r in valid_results
                             if r.get('smiles') is not None]
 
-        # ── 2. Uniqueness ──
+        # ── 2. Uniqueness（QMG Eq.5） ──
         unique_smiles_set = set(valid_smiles_list)
         n_unique = len(unique_smiles_set)
         uniqueness = n_unique / n_valid if n_valid > 0 else 0.0
@@ -206,7 +191,7 @@ class MoleculeEvaluator:
         }
 
     def format_metrics(self, metrics: Dict[str, float]) -> str:
-        """格式化指標為可讀文字。"""
+        """格式化指標為可讀文字（QMG 論文定義）。"""
         return (
             f"  Validity   : {metrics['validity']:.4f}  "
             f"({metrics['n_valid']}/{metrics['n_total']})\n"
