@@ -10,7 +10,7 @@ SQMG Kernel — 3N+2 CUDA-Q 參數化量子線路 (v7 Dynamic Circuit)
 • 無 Cross-atom coupling（暫未包含）。
 • 鍵暫存器 (Bond Register)：2 顆量子位元，每個鍵使用 3 個參數
   （RY + Ctrl-RY + Ctrl-RY），全上三角 N(N-1)/2 bonds。
-• 動態電路 (Dynamic Circuit)：原子先測量，Bond 條件執行。
+• 靜態 Bond 執行：原子先測量（用於 bitstring），Bond 無條件執行（sm_70 相容）。
 • Atom 0 硬約束：X 閘強制非 NONE。
 • 無 Ancilla。
 • 總量子位元數 = 3N + 2。
@@ -106,17 +106,15 @@ def sqmg_circuit(thetas: list[float], n_atoms: int):
     # (已移除無論文對應的 Cross-atom CRY)
 
     # ================================================================
-    # 測量所有原子，準備條件執行 (Dynamic Circuit)
+    # 原子測量 — 產生 atom bits 進入 bitstring
     # ================================================================
-    # CUDA-Q 0.12 nvidia/sm_70 相容寫法：
-    # 使用預先建立的固定長度 list，逐元素賦值，避免 .append()。
-    # .append() 在 CUDA-Q JIT 編譯時會產生與 sm_70 不相容的動態記憶體操作。
-    atom_exists = [False] * n_atoms
+    # 無條件逐一測量所有原子量子位元，結果寫入古典 bitstring。
+    # 注意：atom_exists 條件判斷已移除（sm_70 不支援動態電路控制流），
+    # bond block 改為無條件執行，NONE 原子的 bond 由 MoleculeDecoder 過濾。
     for i in range(n_atoms):
-        m0 = mz(q_atoms[3 * i])
-        m1 = mz(q_atoms[3 * i + 1])
-        m2 = mz(q_atoms[3 * i + 2])
-        atom_exists[i] = m0 or m1 or m2
+        mz(q_atoms[3 * i])
+        mz(q_atoms[3 * i + 1])
+        mz(q_atoms[3 * i + 2])
 
     # ================================================================
     # Bond Blocks: 全上三角 N(N-1)/2 bonds (Dynamic Circuit)
@@ -136,11 +134,14 @@ def sqmg_circuit(thetas: list[float], n_atoms: int):
     for atom_i in range(n_atoms):
         for atom_j in range(atom_i + 1, n_atoms):
 
-            # 條件執行：兩端原子均存在時才激活 Bond
-            if atom_exists[atom_i] and atom_exists[atom_j]:
-                ry(thetas[bp],     q_bond[0])                      # gate 1: bond existence
-                ry.ctrl(thetas[bp + 1], q_bond[0], q_bond[1])      # gate 2: single→double
-                ry.ctrl(thetas[bp + 2], q_bond[1], q_bond[0])      # gate 3: double→triple
+            # sm_70 (V100) + CUDA-Q 0.12 相容寫法：無條件執行 bond block。
+            # 原設計的條件執行（if atom_exists[...]）需要動態電路控制流，
+            # cuStateVec 在 sm_70 上不支援此功能，會產生 architecture mismatch。
+            # 移除條件後語意不變：MoleculeDecoder 解碼時會依 atom_present
+            # 跳過兩端有 NONE 原子的 bond，不影響分子結構正確性。
+            ry(thetas[bp],     q_bond[0])                      # gate 1: bond existence
+            ry.ctrl(thetas[bp + 1], q_bond[0], q_bond[1])      # gate 2: single→double
+            ry.ctrl(thetas[bp + 2], q_bond[1], q_bond[0])      # gate 3: double→triple
 
             # 測量與重置 (Bond reuse)
             mz(q_bond[0])
@@ -233,5 +234,5 @@ class SQMGKernel:
             f"  Atom 0 bias       : X gate (statistical bias toward non-NONE; hard filter in Decoder)\n"
             f"  Bond ansatz       : RY(exist) + Ctrl-RY(single→double) + Ctrl-RY(double→triple)\n"
             f"  Bond states       : |00⟩=無鍵, |10⟩=單鍵, |11⟩=雙鍵, |01⟩=三鍵  (4 reachable)\n"
-            f"  Bond execution    : Conditional (dynamic circuit)"
+            f"  Bond execution    : Unconditional (sm_70/V100 compatible; decoder filters NONE bonds)"
         )
