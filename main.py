@@ -323,7 +323,7 @@ def main():
     evaluator = MoleculeEvaluator()
     extended_history: List[Dict] = []
     all_molecules: List[Dict] = []
-    best_so_far = [-np.inf]  # 用 list 以便在 callback 中修改
+    best_so_far = [0.0]  # 初始 0.0，使第一次有效 fitness 突破時能正確印出
     iteration_callback = create_iteration_callback(kernel, decoder, evaluator, extended_history, all_molecules, best_so_far)
 
     print(f"\n{'─' * 70}\nStep 6: 初始化 SOQPSO 優化器\n{'─' * 70}")
