@@ -69,8 +69,6 @@ def sqmg_circuit(thetas: list[float], n_atoms: int):
     q_atoms = cudaq.qvector(3 * n_atoms)
     q_bond = cudaq.qvector(2)
 
-    n_atom_params = 9 * n_atoms
-
     # ================================================================
     # Atom 0 統計偏置：X 閘降低 NONE 的輸出機率
     # ================================================================
@@ -108,15 +106,19 @@ def sqmg_circuit(thetas: list[float], n_atoms: int):
     # ================================================================
     # 測量所有原子，準備條件執行 (Dynamic Circuit)
     # ================================================================
-    # 在真實硬體中，此舉會讓原子態塍縮為古典位元
-    # 注意：atom_exists 的 list + or 運算可能需 CUDA-Q 版本支援
-    # 若 JIT 不支援，請改為無條件執行並在 decoder 層模擬條件行為
-    atom_exists = [False] * n_atoms
+    # CUDA-Q @kernel 限制說明：
+    #   ✗ [False] * n_atoms   — n_atoms 為 runtime 參數，JIT 無法靜態分配
+    #   ✗ atom_exists[i] = v  — @kernel 內不支援 list 的 index 賦值
+    #   ✓ cudaq.quake_value    — 可累積 mz() 的 bool 結果
+    #
+    # 解決策略：直接測量所有原子 bits，僅保留各原子的「是否存在」bool，
+    # 並儲存至 cudaq 可接受的 list[bool] 初始化形式（用 append 而非 index 賦值）。
+    atom_exists: list[bool] = []
     for i in range(n_atoms):
         m0 = mz(q_atoms[3 * i])
         m1 = mz(q_atoms[3 * i + 1])
         m2 = mz(q_atoms[3 * i + 2])
-        atom_exists[i] = m0 or m1 or m2
+        atom_exists.append(m0 or m1 or m2)
 
     # ================================================================
     # Bond Blocks: 全上三角 N(N-1)/2 bonds (Dynamic Circuit)
