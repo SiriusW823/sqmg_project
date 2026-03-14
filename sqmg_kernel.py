@@ -10,7 +10,7 @@ SQMG Kernel — 3N+2 CUDA-Q 參數化量子線路 (v7 Dynamic Circuit)
 • 無 Cross-atom coupling（暫未包含）。
 • 鍵暫存器 (Bond Register)：2 顆量子位元，每個鍵使用 3 個參數
   （RY + Ctrl-RY + Ctrl-RY），全上三角 N(N-1)/2 bonds。
-• 動態電路 (Dynamic Circuit)：原子先測量，Bond 條件執行。
+• 動態電路 (Dynamic Circuit)：原子先測量後，Bond 無條件執行（條件過濾交由 Decoder）。
 • Atom 0 硬約束：X 閘強制非 NONE。
 • 無 Ancilla。
 • 總量子位元數 = 3N + 2。
@@ -55,12 +55,12 @@ def sqmg_circuit(thetas: list[float], n_atoms: int):
             Ring-CNOT
             Layer 2 RY: thetas[9i+6..8]
 
-    Bond Register: 3 params/bond (全上三角，N(N-1)/2 bonds)
+    Bond Register: 3 params/bond (全上三角，N(N-1)/2 bonds，無條件執行)
         Bond pair bp_idx 按上三角順序排列
         thetas[9N + 3*bp_idx : +3]
-            Param 1 (RY on q_bond[0])            : 控制鍵結是否存在 (|00⟩→|10⟩)
-            Param 2 (CRY on q_bond[1], ctrl q[0]): 控制鍵結階數 single→double (|10⟩→|11⟩)
-            Param 3 (CRY on q_bond[0], ctrl q[1]): 控制鍵結階數 double→triple (|11⟩→|01⟩)
+            Param 0 (RY on q_bond[0])            : bond existence
+            Param 1 (CRY on q_bond[1], ctrl q[0]): single→double
+            Param 2 (CRY on q_bond[0], ctrl q[1]): double→triple
 
     總參數量 = 9N + 3·N(N-1)/2
     Bit-string 長度 = 3N + N(N-1) = N² + 2N
@@ -104,47 +104,44 @@ def sqmg_circuit(thetas: list[float], n_atoms: int):
     # (已移除無論文對應的 Cross-atom CRY)
 
     # ================================================================
-    # 測量所有原子，準備條件執行 (Dynamic Circuit)
+    # 測量所有原子（測量順序：原子位元先，鍵結位元後）
     # ================================================================
-    # CUDA-Q @kernel 限制說明：
-    #   ✗ [False] * n_atoms   — n_atoms 為 runtime 參數，JIT 無法靜態分配
-    #   ✗ atom_exists[i] = v  — @kernel 內不支援 list 的 index 賦值
-    #   ✓ cudaq.quake_value    — 可累積 mz() 的 bool 結果
+    # 設計說明：atom bits 在此統一測量，bond bits 在下方 bond loop 中測量。
+    # 測量順序與 molecule_decoder.parse_bitstring 的讀取順序一致：
+    #   bitstring = [atom_bits(3N)] + [bond_bits(N(N-1))]
     #
-    # 解決策略：直接測量所有原子 bits，僅保留各原子的「是否存在」bool，
-    # 並儲存至 cudaq 可接受的 list[bool] 初始化形式（用 append 而非 index 賦值）。
-    atom_exists: list[bool] = []
+    # ⚠ 為何不做條件執行（Unconditional Bond Execution）：
+    #   條件執行（if atom_exists[i]）需要 classical feedback，
+    #   CUDA-Q 的 tensornet / nvidia 後端不支援此功能。
+    #   此外，CUDA-Q Kernel Spec 明確禁止：
+    #     (1) [False] * n_atoms  — runtime 變數建立 list
+    #     (2) atom_exists[i] = v — list index 賦值
+    #   因此改為無條件執行：bond gates 對所有 bond pair 均執行，
+    #   「兩端原子是否存在」的過濾交由 MoleculeDecoder.decode_bitstring() 處理。
+    # ================================================================
     for i in range(n_atoms):
-        m0 = mz(q_atoms[3 * i])
-        m1 = mz(q_atoms[3 * i + 1])
-        m2 = mz(q_atoms[3 * i + 2])
-        atom_exists.append(m0 or m1 or m2)
+        mz(q_atoms[3 * i])
+        mz(q_atoms[3 * i + 1])
+        mz(q_atoms[3 * i + 2])
 
     # ================================================================
-    # Bond Blocks: 全上三角 N(N-1)/2 bonds (Dynamic Circuit)
+    # Bond Blocks: 全上三角 N(N-1)/2 bonds（無條件執行）
     # 順序：(0,1),(0,2),...,(0,N-1),(1,2),...,(N-2,N-1)
     #
-    # 條件執行 (Conditional Bond Execution)：
-    # 只有當兩端原子都存在時，才激活 Bond 模組，淨化機率景觀。
-    #
-    # Bond 子電路物理語義 (3-gate, 4 reachable states)：
-    #   Gate 1 (RY on q_bond[0])              : |00⟩ ↔ |10⟩  bond existence
-    #   Gate 2 (CRY on q_bond[1], ctrl q[0])  : |10⟩ ↔ |11⟩  single→double
-    #   Gate 3 (CRY on q_bond[0], ctrl q[1])  : |11⟩ ↔ |01⟩  double→triple
+    # Bond 子電路物理語義 (3-gate)：
+    #   Gate 1 (RY on q_bond[0])              : bond existence
+    #   Gate 2 (CRY on q_bond[1], ctrl q[0])  : single→double
+    #   Gate 3 (CRY on q_bond[0], ctrl q[1])  : double→triple
     #
     #   可達態：|00⟩=無鍵, |10⟩=單鍵, |11⟩=雙鍵, |01⟩=三鍵
     # ================================================================
     bp = param_idx
     for atom_i in range(n_atoms):
         for atom_j in range(atom_i + 1, n_atoms):
+            ry(thetas[bp],     q_bond[0])                      # gate 1: bond existence
+            ry.ctrl(thetas[bp + 1], q_bond[0], q_bond[1])      # gate 2: single→double
+            ry.ctrl(thetas[bp + 2], q_bond[1], q_bond[0])      # gate 3: double→triple
 
-            # 條件執行：兩端原子均存在時才激活 Bond
-            if atom_exists[atom_i] and atom_exists[atom_j]:
-                ry(thetas[bp],     q_bond[0])                      # gate 1: bond existence
-                ry.ctrl(thetas[bp + 1], q_bond[0], q_bond[1])      # gate 2: single→double
-                ry.ctrl(thetas[bp + 2], q_bond[1], q_bond[0])      # gate 3: double→triple
-
-            # 測量與重置 (Bond reuse)
             mz(q_bond[0])
             mz(q_bond[1])
             reset(q_bond[0])
