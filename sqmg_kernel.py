@@ -111,12 +111,12 @@ def sqmg_circuit(thetas: list[float], n_atoms: int):
     # 在真實硬體中，此舉會讓原子態塍縮為古典位元
     # 注意：atom_exists 的 list + or 運算可能需 CUDA-Q 版本支援
     # 若 JIT 不支援，請改為無條件執行並在 decoder 層模擬條件行為
-    atom_exists = []
+    atom_exists = [False] * n_atoms
     for i in range(n_atoms):
         m0 = mz(q_atoms[3 * i])
         m1 = mz(q_atoms[3 * i + 1])
         m2 = mz(q_atoms[3 * i + 2])
-        atom_exists.append(m0 or m1 or m2)
+        atom_exists[i] = m0 or m1 or m2
 
     # ================================================================
     # Bond Blocks: 全上三角 N(N-1)/2 bonds (Dynamic Circuit)
